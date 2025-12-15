@@ -17,6 +17,7 @@
 
 Treat `docs/` as source-of-truth for behavior. **Read the relevant doc(s) before editing code**:
 
+- Before changing the end-to-end workflow, CLI UX, logging, or step ordering, read `docs/functional_spec.md`.
 - Before changing scope/safety/MVP behavior, read `docs/plan.md`.
 - Before changing folder naming, “bounded specificity”, or when to create new folders, read `docs/folder_taxonomy_guide.md`.
 - Before changing ADK prompts/agents/session-state patterns (especially `ai_folder_sorter/adk_agents.py`), read `docs/adk_general_guide.md`.

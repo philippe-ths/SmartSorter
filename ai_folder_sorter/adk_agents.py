@@ -1,240 +1,171 @@
 from __future__ import annotations
 
-import asyncio
+import json
 import os
+from dataclasses import dataclass
 from typing import Any, Optional
 
-from .models import FolderDecision, Summary, TargetFolder
-from .utils import normalize_folder_name, parse_json_object_maybe, safe_get_str
+from google import genai
 
 
-def _require_adk():
-    try:
-        from google.adk.agents import LlmAgent  # noqa: F401
-        from google.adk.runners import InMemoryRunner  # noqa: F401
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Google ADK is not available. Install it (and configure model credentials) or run with --allow-fallback."
-        ) from e
+@dataclass(frozen=True)
+class Models:
+    summariser: str
+    matcher: str
+    critic: str
 
 
-def preflight_adk_auth() -> None:
-    """
-    ADK's GoogleLLM uses google.genai.Client() without explicit args, so auth must
-    be provided via environment variables.
-    """
-    api_key = (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
-    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "0").strip().lower() in {"1", "true"}
-    project = (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
-    location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip()
-
+def _client(*, timeout_seconds: int) -> genai.Client:
+    # google-genai expects http_options.timeout in milliseconds (min 10s enforced server-side).
+    timeout_ms = max(int(timeout_seconds) * 1000, 10_000)
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     if api_key:
-        return
-
-    if use_vertex and (project or location):
-        return
-
-    raise RuntimeError(
-        "ADK/LLM auth is not configured.\n"
-        "- For Gemini API: set GOOGLE_API_KEY (or GEMINI_API_KEY).\n"
-        "- For Vertex AI: set GOOGLE_GENAI_USE_VERTEXAI=1 and GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION "
-        "(and have ADC configured).\n"
-    )
+        return genai.Client(api_key=api_key, http_options={"timeout": timeout_ms})
+    return genai.Client(http_options={"timeout": timeout_ms})
 
 
-async def _run_agent_once(*, agent: Any, state_delta: dict[str, Any], timeout_seconds: int) -> str:
-    from google.adk.runners import InMemoryRunner, types
-
-    runner = InMemoryRunner(agent, app_name="smart_sorter")
-    runner.session_service.create_session_sync(app_name="smart_sorter", user_id="smart_sorter", session_id="default")
-    last_text = ""
-    agen = runner.run_async(
-        user_id="smart_sorter",
-        session_id="default",
-        new_message=types.UserContent(parts=[types.Part(text="Run now.")]),
-        state_delta=state_delta,
-    )
-
-    async def _consume() -> str:
-        nonlocal last_text
-        async for event in agen:
-            if event.error_message:
-                raise RuntimeError(event.error_message)
-            content = getattr(event, "content", None)
-            parts = getattr(content, "parts", None) if content else None
-            if not parts:
-                continue
-            text_parts: list[str] = []
-            for p in parts:
-                t = getattr(p, "text", None)
-                if isinstance(t, str) and t:
-                    text_parts.append(t)
-            if text_parts:
-                last_text = "\n".join(text_parts).strip()
-            if getattr(event, "turn_complete", False) and last_text:
-                return last_text
-        return last_text
-
-    try:
-        return await asyncio.wait_for(_consume(), timeout=timeout_seconds)
-    except asyncio.TimeoutError as e:
-        raise TimeoutError(f"ADK call timed out after {timeout_seconds}s") from e
-
-
-def _run_agent_once_sync(*, agent: Any, state_delta: dict[str, Any], timeout_seconds: int) -> str:
-    return asyncio.run(_run_agent_once(agent=agent, state_delta=state_delta, timeout_seconds=timeout_seconds))
-
-
-def summarize_with_adk(
-    *,
-    model: str,
-    filename: str,
-    mime_type: str,
-    text_snippet: str,
-    metadata: dict[str, Any],
-    timeout_seconds: int,
-) -> Optional[Summary]:
-    _require_adk()
-    preflight_adk_auth()
-    from google.adk.agents import LlmAgent
-
-    agent = LlmAgent(
-        name="summariser_agent",
+def _call_json(model: str, instruction: str, payload: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
+    client = _client(timeout_seconds=timeout_seconds)
+    prompt = instruction.strip() + "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
+    resp = client.models.generate_content(
         model=model,
-        include_contents="none",
-        instruction=(
-            "You summarise a file for semantic filing.\n"
-            "Input JSON:\n"
-            "{file_json}\n\n"
-            "Rules:\n"
-            "- Ignore file type for subject; focus on topic/intent.\n"
-            "- Output ONLY valid JSON with keys: summary, keywords, subject_label.\n"
-            "- keywords must be a short list of strings.\n"
-            "- subject_label should be 2-6 words.\n"
-        ),
+        contents=prompt,
+        config={
+            "response_mime_type": "application/json",
+        },
     )
-
-    file_json = {
-        "filename": filename,
-        "mimeType": mime_type,
-        "textSnippet": text_snippet,
-        "metadata": metadata,
-    }
-    resp_text = _run_agent_once_sync(agent=agent, state_delta={"file_json": file_json}, timeout_seconds=timeout_seconds)
-    obj = parse_json_object_maybe(resp_text)
-    summary = safe_get_str(obj, "summary") or ""
-    subject_label = safe_get_str(obj, "subject_label") or ""
-    keywords = obj.get("keywords") if isinstance(obj.get("keywords"), list) else []
-    keywords = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
-    if not summary or not subject_label:
-        return None
-    return Summary(summary=summary, keywords=keywords, subject_label=subject_label)
+    text = (resp.text or "").strip()
+    if not text:
+        raise RuntimeError("Empty model response.")
+    try:
+        return json.loads(text)
+    except Exception as e:
+        raise RuntimeError(f"Model returned non-JSON: {text[:500]}") from e
 
 
-def decide_folder_with_adk(
+def summarize_file(*, model: str, file_name: str, text: str, timeout_seconds: int) -> dict[str, Any]:
+    instruction = """
+You summarise a file into a strict JSON object with keys:
+- summary: string, max 200 characters
+- subject_label: string, max 50 characters
+- keywords: array of 5 to 8 short words/phrases
+
+Rules:
+- Base the result ONLY on the provided extracted text. Do not guess from file name, path, or metadata.
+- Keep it concise and factual.
+- Return JSON only.
+""".strip()
+    out = _call_json(model, instruction, {"file_name": file_name, "text": text}, timeout_seconds=timeout_seconds)
+    if isinstance(out, list) and len(out) == 1 and isinstance(out[0], dict):
+        out = out[0]
+    summary = str(out.get("summary", "")).strip()
+    subject_label = str(out.get("subject_label", "")).strip()
+    keywords = out.get("keywords") or []
+    if not isinstance(keywords, list):
+        keywords = []
+    keywords = [str(k).strip() for k in keywords if str(k).strip()]
+    summary = summary[:200]
+    subject_label = subject_label[:50]
+    if len(keywords) < 5:
+        keywords = keywords[:8]
+    else:
+        keywords = keywords[:8]
+    return {"summary": summary, "subject_label": subject_label, "keywords": keywords}
+
+
+def match_folder(
     *,
     model: str,
     file_profile: dict[str, Any],
-    existing_folders: list[dict[str, str]],
-    timeout_seconds: int,
-) -> Optional[FolderDecision]:
-    _require_adk()
-    preflight_adk_auth()
-    from google.adk.agents import LlmAgent
-
-    agent = LlmAgent(
-        name="folder_matcher_agent",
-        model=model,
-        include_contents="none",
-        instruction=(
-            "You choose a semantic folder for a file.\n"
-            "Input JSON:\n"
-            "{input_json}\n\n"
-            "Rules:\n"
-            "- Prefer existing folders; create new folders only as a last resort.\n"
-            "- Foldering must be semantic (content/intent), never by file type (no 'PDFs', 'Images', etc.).\n"
-            "- Avoid entity-based and time-based names (no people, companies, years, quarters).\n"
-            "- Prefer plain-language, stable, role-based plural nouns (e.g., 'Agreements', 'Receipts', 'Plans').\n"
-            "- Output ONLY valid JSON with keys: target_folder (object with keys: name, exists), "
-            "index_description_if_new, rationale.\n"
-        ),
-    )
-
-    input_json = {"file_profile": file_profile, "existing_folders": existing_folders}
-    resp_text = _run_agent_once_sync(
-        agent=agent, state_delta={"input_json": input_json}, timeout_seconds=timeout_seconds
-    )
-    obj = parse_json_object_maybe(resp_text)
-    tf = obj.get("target_folder") if isinstance(obj.get("target_folder"), dict) else {}
-    name = normalize_folder_name(safe_get_str(tf, "name") or "")
-    exists_val = tf.get("exists")
-    exists = bool(exists_val) if isinstance(exists_val, bool) else False
-    index_desc = safe_get_str(obj, "index_description_if_new") or ""
-    rationale = safe_get_str(obj, "rationale") or ""
-    if not name:
-        return None
-    return FolderDecision(
-        target_folder=TargetFolder(name=name, exists=exists),
-        index_description_if_new=index_desc,
-        rationale=rationale,
-    )
-
-
-def critique_plan_with_adk(
-    *,
-    model: str,
-    draft_plan: dict[str, Any],
+    existing_folders: list[dict[str, Any]],
+    critique_hint: Optional[dict[str, Any]],
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    """
-    Reviews the entire draft plan and returns either approval or specific revisions.
+    instruction = """
+You decide where to place a file into an existing folder or propose ONE new folder.
 
-    Expected output JSON:
-      {
-        "approved": true|false,
-        "revised_assignments": [
-          {
-            "file_key": "...",
-            "target_folder": {"name": "..."},
-            "index_description_if_new": "...",
-            "rationale": "..."
-          }
-        ],
-        "notes": "..."
-      }
-    """
-    _require_adk()
-    preflight_adk_auth()
-    from google.adk.agents import LlmAgent
+You MUST follow bounded specificity rules:
+- Prefer existing folders by default.
+- New folders must be plain-language, stable, human-recognisable categories (prefer plural nouns).
+- Avoid entity-based names (people, companies), time-based names (years, quarters), and filetype buckets (PDFs, Images).
+- Create a new folder only if it has strong recurring value.
 
-    agent = LlmAgent(
-        name="plan_critic_agent",
-        model=model,
-        include_contents="none",
-        instruction=(
-            "You are a critic reviewing a draft file-organisation plan.\n"
-            "Input JSON:\n"
-            "{draft_plan}\n\n"
-            "Your job:\n"
-            "- Enforce bounded specificity: prefer reusing existing/proposed folders; avoid creating many tiny folders.\n"
-            "- Reject type buckets (PDFs/Images/etc), entity-based names (people/companies), and time-based names (years/quarters).\n"
-            "- Prefer plain-language, stable, role-based plural nouns.\n"
-            "- Keep folder counts reasonable (target ~7-12, soft cap ~15) by merging near-duplicates.\n\n"
-            "Output ONLY valid JSON with keys:\n"
-            "- approved (boolean)\n"
-            "- revised_assignments (list; empty if approved). Each item must include: file_key, "
-            "target_folder (object with key: name), index_description_if_new, rationale.\n"
-            "- notes (string)\n"
-            "Rules:\n"
-            "- Only propose changes when clearly beneficial; otherwise set approved=true.\n"
-            "- Do not invent file keys; use only file_key values from the input.\n"
-        ),
+Additional guidance for saved web content:
+- If the content is a saved webpage / HTML source / view-source, prefer role-based buckets like "Websites", "Web Pages", "Company Profiles", or "Research".
+- Do NOT create entity-named folders like "About Table of Content" or "Table of Content".
+- Avoid vague non-noun folder names like "About".
+
+Examples:
+- Saved company homepage HTML -> "Websites" or "Company Profiles"
+- Saved article / reference page -> "Research" or "Reference"
+
+Return strict JSON:
+{
+  "file_name": "...",
+  "target_folder": {"name": "...", "exists": true|false},
+  "index_desc_if_new": "..." | null,
+  "rationale": "..."
+}
+
+Return JSON only.
+""".strip()
+    payload: dict[str, Any] = {"file_profile": file_profile, "existing_folders": existing_folders}
+    if critique_hint:
+        payload["critique_hint"] = critique_hint
+    out = _call_json(model, instruction, payload, timeout_seconds=timeout_seconds)
+    if isinstance(out, list) and len(out) == 1 and isinstance(out[0], dict):
+        out = out[0]
+    if not isinstance(out, dict):
+        raise RuntimeError(f"Expected object, got {type(out).__name__}")
+    return out
+
+
+def critique_plan(
+    *,
+    model: str,
+    file_profile: dict[str, Any],
+    file_plan: dict[str, Any],
+    existing_folders: list[dict[str, Any]],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    instruction = """
+You are a critic that checks whether a placement plan is acceptable and low-surprise.
+
+Acceptance guidance:
+- Approve when the placement is what a reasonable human would expect.
+- Reject when the folder is too specific, entity-based, or time-based, or when a better existing folder clearly fits,
+  or when creating a new folder lacks strong recurring value.
+- Reject vague non-noun folder names like "About" (prefer "Company Profiles" / "Websites" etc.).
+  In particular for saved webpages / company homepages, prefer "Websites" or "Company Profiles" over "Projects" or "About".
+
+Return strict JSON:
+{
+  "file_name": "...",
+  "target_folder_name": "...",
+  "acceptable": true|false,
+  "critique_rationale": "...",
+  "suggested_adjustments": {
+    "action": "keep"|"use_existing_folder"|"create_new_folder"|"skip",
+    "suggested_folder_name": "...",
+    "suggested_index_desc_if_new": "...",
+    "suggested_rationale": "..."
+  } | null
+}
+
+Rules for suggested_adjustments:
+- If action="use_existing_folder", suggested_folder_name MUST be exactly one of the provided existing folder names.
+- Do not suggest entity-based folder names (companies/people) even if the file is about that entity.
+
+Return JSON only.
+""".strip()
+    out = _call_json(
+        model,
+        instruction,
+        {"file_profile": file_profile, "file_plan": file_plan, "existing_folders": existing_folders},
+        timeout_seconds=timeout_seconds,
     )
-
-    resp_text = _run_agent_once_sync(
-        agent=agent, state_delta={"draft_plan": draft_plan}, timeout_seconds=timeout_seconds
-    )
-    obj = parse_json_object_maybe(resp_text)
-    if "approved" not in obj:
-        return {}
-    return obj if isinstance(obj, dict) else {}
+    if isinstance(out, list) and len(out) == 1 and isinstance(out[0], dict):
+        out = out[0]
+    if not isinstance(out, dict):
+        raise RuntimeError(f"Expected object, got {type(out).__name__}")
+    return out
