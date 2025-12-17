@@ -1,282 +1,230 @@
-# Process 
+# process.md
 
-### 1) Select target folder (local path)
+## Purpose
+Organise a user-chosen **local** target folder by building and storing semantic profiles for files, then generating a **global plan** that can both place new files and refactor existing folders (splits) when strong subtopic clusters emerge.
 
+## Models (explicit)
+All Google ADK agents use a fast, low-cost model:
+- Summariser Agent (`LlmAgent`): `gemini-2.0-flash-lite`
+- Planning Agent (`LlmAgent`): `gemini-2.0-flash-lite`
+- Critic Agent (`LlmAgent`): `gemini-2.0-flash-lite`
+- Repair Agent (only when critic rejects): `gemini-2.0-flash-lite`
+
+---
+
+## 1) Select target folder (local path)
 - User provides a local filesystem path (target folder).
+- Treat a synced “local Google Drive” folder as normal local storage. No Drive APIs.
+- Enforce: operate only within the target folder and its subfolders.
 
-- Treat a “local Google Drive folder” (synced) as normal local storage. No Drive APIs.
-
-- Enforce: operate only within target folder and its direct subfolders.
-
-- **Logging (--logging)**
-~~~
+**Logging (`--logging`)**
+```text
 [init] Target: /abs/path/to/target
-[init] Models: summariser=gemini-2.0-flash-lite, matcher=gemini-2.0-flash-lite
+[init] Models: summariser=gemini-2.0-flash-lite, planner=gemini-2.0-flash-lite, critic=gemini-2.0-flash-lite
 [init] Mode: dry-run (apply=false)
-~~~
+```
 
-### 2) Scan the target folder (top-level only)
+## 2) Inventory scan (bounded depth)
+- List files in:
+  - the target folder root
+  - each **direct subfolder** of the target folder
+- Do not traverse deeper than 1 folder level.
 
-- List only direct children (no recursion).
-
-- Split into:
-
-   - files to process
-
-   - existing subfolders (candidates for placement)
-
-- **Logging (` --logging `)**
-
-~~~
-[scan] Files to process (12):
+**Logging (`--logging`)**
+```text
+[scan] Root files to consider (12):
   - file1.pdf
   - file2.txt
-[scan] Existing subfolders (5):
+[scan] Direct subfolders (5):
+  - Scouts
   - Finance
-  - Projects
-~~~
+[scan] Depth-1 files to consider (88)
+```
 
-### 3) Build existing folder context
+## 3) Build folder context
+- For each direct subfolder:
+  - read `_index.md` if present
+  - build a folder profile from folder name + short description from `_index.md`
 
-- For each existing direct subfolder:
-
-   - read ` _index.md ` if present
-
-   - build a folder profile from folder name + short description from ` _index.md `
-
-- **Logging (` --logging `)**
-
-~~~
+**Logging (`--logging`)**
+```text
 [context] Folder profiles (5):
+  - Scouts (index: yes) desc: scouts admin, activities, plans
   - Finance (index: yes) desc: invoices, tax, banking
-  - Projects (index: no)
-~~~
+```
 
-### 4) For each top-level file
+## 4) Build or refresh file profiles (store-first)
+### 4.1 Profile store lookup
+- Maintain a local store of file intelligence (for example, under `.aifo/` in the target folder).
+- For each file in the inventory:
+  - if a stored profile exists and the file is unchanged (mtime/size), reuse it
+  - otherwise, extract and summarise, then upsert the profile
 
-- Pipeline summary (mental model)
+**Logging (`--logging`)**
+```text
+[store] Loaded profiles: 83
+[store] Needs summarise: 17
+```
 
-   - Extract bounded text (4.1)
-   - Summarise into `file_profile` JSON (4.3)
-   - Match to folder → initial `file_plan` (4.4)
-   - Critique the plan (5)
-   - If rejected: rematch using critique (5.2) up to `--critic-iterations`
-   - Aggregate into an execution plan (6)
-   - Apply changes only with `--apply` (7)
-
-- 4.1 Extract content (bounded, no fallback)
-
+### 4.2 Extract content (bounded, no fallback)
 - Extract text using extension or MIME sniffing.
-
-- Cap extraction at ` --max-chars ` (default 60k).
-
-- If usable extracted text is below ` --min-chars ` (default 500), skip the file.
-
+- Cap extraction at `--max-chars` (default 60k).
+- If usable extracted text is below `--min-chars` (default 500), **skip** the file.
 - No fallback to filename or metadata.
 
-- **Logging (`--logging`)**
-
-~~~
-[extract] file1.pdf method=pdf-text chars=43120 (truncated=false)
+**Logging (`--logging`)**
+```text
+[extract] Scouts/risk_assessment_01.pdf method=pdf-text chars=43120 (truncated=false)
 [extract] scan.png method=image chars=0
 [skip] scan.png reason="insufficient extracted text" chars=0 min=500
-~~~
-
-### 4.2 Start Google ADK sequence 
-
-- Orchestration layer 
-
-- Sequence ending in Critic Loop
+```
 
 ### 4.3 Summarise with Google ADK (Summariser Agent)
+- Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to produce `file_profile` JSON:
+  - `summary` (max 200 characters)
+  - `subject_label` (max 50 characters)
+  - `keywords` (5–8)
+- Save `file_profile` into the local store for future global planning.
 
-- Run ADK LlmAgent (model gemini-2.0-flash-lite) to produce file_profile JSON:
+**Logging (`--logging`)**
+```text
+[summarise] risk_assessment_01.pdf summary="Risk assessment for Scouts hike activity, hazards and mitigations." subject_label="Scouts risk assessment" keywords=[Scouts, risk, assessment, hike, hazards]
+[store] Upsert profile: Scouts/risk_assessment_01.pdf
+```
 
-   - summary (max 200 characters)
+---
 
-   - subject_label (max 50 characters)
+## 5) Global planning inputs (using stored profiles)
+- Build a planning snapshot from:
+  - all available `file_profile` entries (skipped files are excluded)
+  - current file locations (root and direct subfolders)
+  - folder profiles (names + `_index.md` descriptions)
 
-   - keywords (5–8 words)
+**Logging (`--logging`)**
+```text
+[global] Files with profiles: 98
+[global] Skipped (no usable text): 2
+```
 
-- **Logging (--logging)**
+## 6) Detect strong subtopic clusters (deterministic pre-pass)
+- Compute candidate clusters using stored `keywords` and `subject_label`.
+- Clusters are used as evidence for splits and for more stable folder decisions.
+- Only treat a cluster as “strong” when it meets thresholds (example defaults):
+  - `--min-cluster-size` (default 5)
+  - cluster is semantically narrower than the parent folder theme
 
-~~~
-[summarise] file1.pdf summary="This is a paid invoice (number 89500) from Ability Ltd. to Mr Philippe Marr for emergency plumbing work." subject_label="Ability invoice" keywords=[Ability, invoice, november, payments]
-[summarise] notes.txt summary="Meeting summery and actions between Philippe and James, meeting fouces on design" subject_label="Call notes" keywords=[Client, meetings, work]
-~~~
+**Logging (`--logging`)**
+```text
+[cluster] Folder=Scouts strong_clusters=1
+[cluster]  - "Risk Assessments" size=6 members=[risk_assessment_01.pdf, ...]
+```
 
-### 4.4 Match to folder with Google ADK (Folder Matching Agent)
+## 7) Generate a global plan with Google ADK (Planning Agent)
+- Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to produce a global `plan`.
+- The plan must consider:
+  - existing folders first
+  - whether strong clusters justify creating a new (sub)folder and moving a set of files
+  - avoiding surprise and over-specific folder creation
 
-- Run ADK LlmAgent (model gemini-2.0-flash-lite) to produce `file_plan` using: 
+### 7.1 Plan output schema (global)
+The plan outputs actions and per-file destinations.
+- `actions[]` (ordered):
+  - `create_folder {path, index_desc}`
+  - `move_file {from, to, rationale}`
+  - `update_index {folder_path}`
+- `file_decisions[]`:
+  - `file_path`
+  - `destination_folder_path` (use `(root)` for no move)
+  - `rationale`
 
-   - file_profile (`[{name, summary, keywords}]`)
+Save the plan (including per-file rationale) into the local store.
 
-   - existing_folders: `[{name, _index.md desc}]`
+**Logging (`--logging`)**
+```text
+[plan] Proposed actions:
+  - create_folder: Scouts/Risk Assessments
+  - move_file: Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/ (reason="Risk assessment cluster within Scouts")
+  - move_file: (new) risk_assessment_06.pdf -> Scouts/Risk Assessments/
+[plan] File decisions saved to store
+```
 
-- Output JSON (`file_plan`):
+---
 
-   - file_name
+## 8) Critic loop (global plan review)
+- Purpose: reduce surprising refactors and prevent over-splitting.
+- Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to critique the **global** plan.
+- Critic output JSON:
+  - `acceptable: true/false`
+  - `critique_rationale`
+  - `suggested_adjustments[]` (optional), such as:
+    - “do not create folder, cluster too small”
+    - “use existing folder instead of new folder”
+    - “keep files in place for stability”
 
-   - target_folder: `{name, exists}`
+**Logging (`--logging`)**
+```text
+[critic] acceptable=false rationale="Split is reasonable, but naming should avoid repeating parent. Prefer Scouts/Risk Assessments."
+```
 
-   - Special case: `target_folder.name="(root)"` means “leave in place” (no move). `exists` should be `true`.
+### 8.1 Repair pass (only if critic rejects)
+- Run the Repair Agent (same model) with:
+  - the original plan
+  - the critic feedback
+- Produce a revised plan, then re-run the critic.
+- Repeat up to `--critic-iterations` (default 1–2).
 
-   - index_desc_if_new
+**Logging (`--logging`)**
+```text
+[repair] iter=1 updated plan: rename new folder to Scouts/Risk Assessments
+[critic] iter=1 acceptable=true rationale="Folder split is useful and stable"
+```
 
-   - rationale
+---
 
-- **Logging (`--logging`)**
+## 9) Create execution plan output (dry-run default)
+- Aggregate the final accepted plan into:
+  - folders to create
+  - file moves
+  - `_index.md` creates/updates
+  - skipped files
 
-~~~
-[match] file1.pdf -> Finance (exists=true) rationale="Invoice and payment record" 
-[match] notes.txt -> Client Onboarding (exists=false) new_index_desc="Clients, meetings, work" rationale="Setup notes and checklist"
-~~~
+**Logging (`--logging`)**
+```text
+[exec] Create folders:
+  - Scouts/Risk Assessments
+[exec] Moves:
+  - Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/
+  - risk_assessment_06.pdf -> Scouts/Risk Assessments/
+[exec] Skipped:
+  - scan.png (insufficient extracted text)
+```
 
-### 5) Critic Loop
-
-- Purpose: reduce “surprising” placements and prevent over-specific folder creation.
-
-- Run ADK LlmAgent (model gemini-2.0-flash-lite) to critique the current `file_plan` against `file_profile`.
-
-- Output JSON (`critique`):
-
-   - file_name
-
-   - target_folder_name
-
-   - acceptable: true/false
-
-   - critique_rationale
-
-   - suggested_adjustments (optional)
-
-       - action: one of ["keep", "use_existing_folder", "create_new_folder", "leave_in_root", "skip"]
-
-     - suggested_folder_name (optional)
-
-     - suggested_index_desc_if_new (optional)
-
-     - suggested_rationale (optional)
-
-~~~
-[critique] file1.pdf -> Finance acceptable=true rationale="Invoice and payment record, Finance good fit"
-[critique] notes.txt -> Client Onboarding acceptable=false rationale="Not clearly defined as client onboarding."
-~~~
-
-- Acceptance criteria (guidance for the critic)
-
-   - Approve when the placement is something “a reasonable human would expect”.
-   - Reject when:
-     - the target folder is too specific / entity-based / time-based,
-     - the rationale does not match the file’s content summary,
-     - a better existing folder clearly fits,
-     - the plan creates a new folder without a strong, recurring category.
-
-- Iteration behavior
-
-   - The critic loop runs up to `--critic-iterations` critique/rematch cycles per file (default should be small, e.g. 1–2).
-   - If `acceptable=true`, the current `file_plan` is final.
-   - If `acceptable=false`, the system MUST run the Repair / Rematch step (5.2) to produce a revised `file_plan`, then re-critique.
-   - The loop must converge on one of these terminal outcomes:
-     - **Accepted move**: choose an existing folder, or a justified new folder, and `acceptable=true`.
-     - **Accepted leave-in-root**: set `target_folder.name="(root)"` and `acceptable=true` when creating any folder would be a one-off / low-recurring-value choice.
-   - Avoid “false certainty”: if a file does not justify a new folder and there are no suitable existing folders, leaving it in the root is the intended safe default.
-
-### 5.2 Match to folder with Google ADK in Critic Loop
-
-- Run ADK LlmAgent (model gemini-2.0-flash-lite) to produce a revised `file_plan` using:
-
-   - file_profile (`{name, summary, subject_label, keywords}`)
-
-   - existing_folders: `[{name, _index.md desc}]`
-
-   - critique: the JSON critique from step 5
-
-- Output JSON (`file_plan`, same schema as step 4.4):
-
-   - file_name
-
-   - target_folder: `{name, exists}`
-
-   - index_desc_if_new
-
-   - rationale
-
-- Logging (`--logging`) example (one file)
-
-~~~
-[match] notes.txt -> Client Onboarding (exists=false) rationale="Setup notes and checklist"
-[critic] iter=1 notes.txt -> Client Onboarding acceptable=false critique_rationale="Too specific; not clearly onboarding"
-[rematch] iter=1 notes.txt -> Projects (exists=true) rationale="General project/design call notes"
-[critic] iter=2 notes.txt -> Projects acceptable=true critique_rationale="Projects is a predictable bucket"
-~~~
-
-- Logging (`--logging`) example (reject new folder → leave in root)
-
-~~~
-[match] page.html -> Projects (exists=false) rationale="Mentions company projects"
-[critic] iter=1 page.html -> Projects acceptable=false critique_rationale="Creating a folder for a single file lacks recurring value"
-[rematch] iter=1 page.html -> (root) (exists=true) rationale="No clear reusable category; leave in place"
-[critic] iter=2 page.html -> (root) acceptable=true critique_rationale="Leaving in root avoids a surprising one-off folder"
-~~~
-
-
-
-### 6) Create an execution plan (dry-run default)
-
-- Aggregate:
-
-   - new folders to create
-
-   - moves (file → subfolder)
-
-   - files left in root (explicitly no move)
-
-   - _index.md creates/updates
-
-   - skipped files
-
-- **Logging (--logging)**
-
-~~~
-[plan] Create folders:
-  - file1.pdf -> Client Onboarding
-[plan] Moves:
-  - file2.pdf -> Finance/
-[plan] Leave in root:
-   - page.html (reason="no reusable folder")
-~~~
-
-### 7) Confirm and apply (only with --apply)
-
+## 10) Confirm and apply (only with `--apply`)
 - Prompt once with totals.
-
 - If approved:
+  1) create folders
+  2) move files
+  3) create/update `_index.md` using an idempotent managed section
+  4) record applied destinations back into the local store
 
-- create new subfolders
+**Logging (`--logging`)**
+```text
+[apply] Create folder: Scouts/Risk Assessments/
+[apply] Move: Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/
+[apply] Update index: Scouts/_index.md (managed section)
+[apply] Update index: Scouts/Risk Assessments/_index.md (managed section)
+[store] Mark applied: Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/
+```
 
-- move files
-
-- create/update _index.md using an idempotent managed section
-
-- **Logging (--logging)**
-
-~~~
-[apply] Create folder: file2.pdf -> Client Onboarding/
-[apply] Move: file1.pdf -> Finance/
-[apply] Update index: Finance/_index.md (managed section)
-~~~
-
-### 8) Final report
-
+## 11) Final report
 - Always print summary totals, including skipped.
 
-**Logging (--logging)**
-
-~~~
-[done] Processed: 12 files
-[done] Moved: 10
-[done] Folders created: 1
-[done] Index updated: 3
+**Logging (`--logging`)**
+```text
+[done] Inventory: 100 files
+[done] Profiled: 98
 [done] Skipped: 2 (insufficient extracted text)
-~~~
+[done] Moves applied: 6
+[done] Folders created: 1
+[done] Index updated: 2
+```

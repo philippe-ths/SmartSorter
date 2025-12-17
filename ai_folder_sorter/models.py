@@ -7,6 +7,7 @@ from typing import Any, Literal, Optional
 
 @dataclass(frozen=True)
 class FolderProfile:
+    folder_path: str  # target-relative folder path (POSIX), or "(root)" not used here
     name: str
     desc: Optional[str]
     has_index: bool
@@ -51,7 +52,7 @@ class Critique:
     suggested_rationale: Optional[str] = None
 
 
-ActionKind = Literal["ensure_folder", "move_file", "update_index", "skip_file"]
+ActionKind = Literal["create_folder", "move_file", "update_index", "skip_file"]
 
 
 @dataclass(frozen=True)
