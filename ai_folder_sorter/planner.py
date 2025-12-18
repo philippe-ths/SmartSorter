@@ -403,6 +403,10 @@ def build_local_plan(
             )
         )
 
+        # Save incrementally to avoid losing progress on crash/interrupt
+        if len(files_for_planning) % 5 == 0:
+            save_profiles(target, profiles)
+
     # Store is mandatory: persist profiles even for dry-runs.
     save_profiles(target, profiles)
 
@@ -450,7 +454,7 @@ def build_local_plan(
     critique: Optional[dict[str, Any]] = None
     acceptable = False
     max_iters = max(1, int(critic_iterations))
-    max_iters = min(max_iters, 2)
+    max_iters = min(max_iters, 5)
 
     for iter_idx in range(1, max_iters + 1):
         critique = adk_agents.critique_global_plan(

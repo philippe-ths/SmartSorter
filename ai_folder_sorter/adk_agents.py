@@ -46,6 +46,16 @@ def _call_json(model: str, instruction: str, payload: dict[str, Any], timeout_se
     text = (resp.text or "").strip()
     if not text:
         raise RuntimeError("Empty model response.")
+    
+    # Strip markdown code blocks if present
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
     try:
         return json.loads(text)
     except Exception as e:
