@@ -19,14 +19,14 @@ The system is intentionally LLM-driven: it does not provide a non-LLM heuristic 
 - **Predictable filing**: pick the folder a “reasonable human would expect”.
 - **Low-surprise moves**: avoid narrow, time-based, or entity-based folder creation.
 - **Stable folder set**: prefer reusing existing folders; create new folders only when justified.
-- **Useful refactors**: split folders only when strong recurring subtopic clusters exist.
+- **Useful refactors**: create role folders for broad categories and project/topic folders for mini-collections.
 - **Safety-scoped changes**: only create folders, move files, and write/update `_index.md`.
 - **Explainability**: provide short rationales and clear logs when enabled.
 
 ## 3) Non-Goals
 
 - Deep semantic taxonomy or maximum topical precision.
-- Traversing deeper than one folder level below the target.
+- Traversing deeper than the target folder root (no recursion into subfolders for file processing).
 - Renaming existing folders, deleting files/folders, or modifying user file contents.
 - Guessing based on filename/metadata when content extraction fails.
 - Google Drive API integrations in the default local flow (treat synced Drive folders as normal local storage).
@@ -36,10 +36,9 @@ The system is intentionally LLM-driven: it does not provide a non-LLM heuristic 
 ### 4.1 Local Folder Mode (primary)
 
 - User provides a local filesystem path (the “target folder”).
-- The tool only operates within:
-  - the target folder root, and
-  - its **direct subfolders** (depth 1).
-- No traversal beyond depth 1.
+- The tool only operates within the target folder root.
+- It lists direct children only (no recursion).
+- Existing subfolders are treated as candidates for file placement, but their contents are not processed.
 
 ## 5) User Experience (CLI)
 
@@ -57,7 +56,8 @@ The following flags define the intended UX/behavior:
 - `--max-chars <n>`: cap extracted preview text (default: 60000).
 - `--min-chars <n>`: minimum extracted text to profile a file (default: 500).
 - `--critic-iterations <n>`: max critic/repair iterations for global plan review (default: 1–2).
-- `--min-cluster-size <n>`: minimum cluster size to qualify as a “strong” subtopic cluster (default: 0 = auto-dynamic based on file count).
+- `--min-role-cluster-size <n>`: minimum cluster size for general role folders (default: 4).
+- `--min-project-cluster-size <n>`: minimum cluster size for specific project/topic folders (default: 2).
 - `--show-summaries`: print human-readable summaries from stored profiles / plan decisions.
 - `--logging`: emit structured log-style lines.
 
@@ -69,7 +69,7 @@ The following flags define the intended UX/behavior:
 
 **Rules**:
 - The target must be an existing directory.
-- The tool’s action scope is limited to the target root and its direct subfolders.
+- The tool’s action scope is limited to the target root.
 
 **Logging** (when `--logging`):
 
@@ -79,24 +79,23 @@ The following flags define the intended UX/behavior:
 [init] Mode: dry-run (apply=false)
 ```
 
-### Step 2 — Inventory scan (bounded depth)
+### Step 2 — Inventory scan (top-level only)
 
 **Action**:
-- List files in:
-  - the target folder root, and
-  - each direct subfolder (depth 1).
-- Do not traverse deeper.
+- List only **direct children** of the target folder (no recursion).
+- Split into:
+  - files to process
+  - existing subfolders (candidates for placement)
 
 **Logging**:
 
 ```text
-[scan] Root files to consider (12):
+[scan] Files to process (12):
   - file1.pdf
   - file2.txt
-[scan] Direct subfolders (5):
+[scan] Existing subfolders (5):
   - Scouts
   - Finance
-[scan] Depth-1 files to consider (88)
 ```
 
 ### Step 3 — Build folder context
@@ -177,28 +176,45 @@ Build a planning snapshot from:
 [global] Skipped (no usable text): 2
 ```
 
-### Step 6 — Detect strong subtopic clusters (deterministic pre-pass)
+### Step 6 — Detect clusters for balanced specificity (deterministic pre-pass)
 
-- Compute candidate clusters using stored `keywords` and `subject_label`.
-- Treat a cluster as “strong” only when it meets thresholds such as:
-  - at least `--min-cluster-size` (if 0/unset, dynamically calculated: 2 for <20 files, 3 for <100, 5 for 100+),
-  - semantically narrower than the parent folder theme.
+This step produces **evidence** that the planner uses to decide when to be specific vs general.
 
-Clusters are evidence for stable folder decisions and for deciding when a split is justified.
+#### 6.1 Detect role clusters (general folders)
+Role clusters are broad, recurring “what kind of document is this?” groupings.
+Examples: risk assessments, activity plans, receipts, meeting notes.
+
+- Use stored `keywords`, `subject_label`, and simple signals to find role clusters.
+- Only treat a role cluster as strong when it meets the `--min-role-cluster-size` threshold (default 4).
+
+#### 6.2 Detect project/topic clusters (specific folders)
+Project/topic clusters are “mini-collections” like **Camp Gadgets** or **Photographer badge**.
+
+- A project/topic cluster is eligible when:
+  - it meets the `--min-project-cluster-size` threshold (default 2), and
+  - the files share a clear topic/purpose label, and
+  - it would contain more than one file (hard bias against 1-file folders).
+
+#### 6.3 Precedence rule
+If a file belongs to a project/topic cluster that will get its own folder, **that placement wins** over a general role folder.
 
 **Logging**:
 
 ```text
-[cluster] Folder=Scouts strong_clusters=1
-[cluster]  - "Risk Assessments" size=6 members=[risk_assessment_01.pdf, ...]
+[cluster] Role clusters:
+  - Risk Assessments size=4
+  - Activity Plans size=6
+[cluster] Project/topic clusters:
+  - Camp Gadgets size=2 members=[Camp Gadgets.docx, RA - Camp Gadgets.docx]
 ```
 
 ### Step 7 — Generate a global plan (Planning Agent)
 
 Run an LLM planning agent to produce a global plan that considers:
 - existing folders first,
-- whether strong clusters justify creating a new (sub)folder and moving a set of files,
-- avoiding surprise and over-specific folder creation.
+- creating **role folders** when role clusters are strong,
+- creating **project/topic folders** when a mini-collection exists,
+- avoiding creating one-off folders and surprising splits.
 
 #### 7.1 Global plan output schema
 
@@ -217,15 +233,21 @@ Save the plan (including rationales) to the local store.
 
 ```text
 [plan] Proposed actions:
-  - create_folder: Scouts/Risk Assessments
-  - move_file: Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/ (reason="Risk assessment cluster within Scouts")
-  - move_file: (new) risk_assessment_06.pdf -> Scouts/Risk Assessments/
+  - create_folder: Camp Gadgets
+  - move_file: RA - Camp Gadgets.docx -> Camp Gadgets/ (reason="paired plan + RA mini-collection")
+  - move_file: RA - Pizza ovens.docx -> Risk Assessments/ (reason="risk assessment role; no paired project folder")
 [plan] File decisions saved to store
 ```
 
 ### Step 8 — Critic loop (global plan review) + repair
 
-**Purpose**: reduce surprising refactors and prevent over-splitting.
+**Purpose**: reduce surprising refactors, prevent over-splitting, and enforce taxonomy rules.
+
+**Critic checks**:
+- Are we creating any 1-file folders?
+- Are we creating vague/misleading folders (Admin, Family activities, Documents)?
+- Are we over-splitting (too many new folders in one run)?
+- Are we violating precedence (project folder should win over role folder when it exists)?
 
 **Critic output JSON**:
 - `acceptable: true/false`
@@ -237,9 +259,9 @@ If `acceptable=false`, run a repair pass to produce a revised plan and re-run th
 **Logging**:
 
 ```text
-[critic] acceptable=false rationale="Split is reasonable, but naming should avoid repeating parent. Prefer Scouts/Risk Assessments."
-[repair] iter=1 updated plan: rename new folder to Scouts/Risk Assessments
-[critic] iter=1 acceptable=true rationale="Folder split is useful and stable"
+[critic] acceptable=false rationale="Avoided single-file folder; kept item in Risk Assessments."
+[repair] iter=1 removed one-off folder: Pizza/
+[critic] iter=1 acceptable=true rationale="Balanced: project mini-collections extracted; remaining files grouped into role folders."
 ```
 
 ### Step 9 — Create execution plan output (dry-run default)
@@ -301,14 +323,15 @@ Always print summary totals, including skipped files.
 [done] Index updated: 2
 ```
 
-## 7) Folder Naming, Creation, and Splits (Bounded Specificity)
+## 7) Folder Naming, Creation, and Splits (Balanced Specificity)
 
 Folder naming and creation must follow `docs/folder_taxonomy_guide.md`. In particular:
 
-- Prefer existing folders by default.
-- Create a new folder only when it represents a stable, recurring category.
-- Avoid entity-based and time-based folder names.
-- Split a folder only when a **strong subtopic cluster** exists (clear theme, critical mass, narrower than parent, predictable future).
+- **Balanced Specificity**: Create **project/topic folders** (specific) for mini-collections (2+ files) and **role folders** (general) for broad, recurring categories.
+- **Precedence**: Project/topic folders win over role folders.
+- **Hard bias against 1-file folders**: Avoid creating folders for one-off files.
+- **Predictability**: Folder names must be plain language and pass the "reasonable human guess" test.
+- **Stability**: Avoid entity-based, time-based, or subjective folder names.
 
 ## 8) Safety & Data Handling Requirements
 
@@ -318,7 +341,7 @@ Folder naming and creation must follow `docs/folder_taxonomy_guide.md`. In parti
   - create subfolders under the target folder,
   - create/update `_index.md` within those subfolders,
   - maintain the local profile/plan store (e.g. `.aifo/`).
-- **Bounded depth**: never traverse beyond depth 1 under the target folder.
+- **Bounded depth**: never traverse beyond the target folder root (no recursion for file processing).
 - **Secrets**: OAuth client/token files must not be committed.
 
 ## 9) Error Handling (User-Visible)
@@ -332,9 +355,9 @@ Folder naming and creation must follow `docs/folder_taxonomy_guide.md`. In parti
 
 A run is considered correct if:
 
-- Inventory includes root + direct subfolders (depth 1 only).
+- Inventory includes only direct children of the target folder (no recursion).
 - Files with extracted text < `--min-chars` are skipped from profiling/planning.
 - A profile store is used to reuse summaries for unchanged files.
-- Strong clusters can justify splits and bulk moves, and weak clusters do not.
+- Balanced specificity is achieved: project/topic folders for mini-collections, role folders for broad categories, and no 1-file folders.
 - Apply mode prompts once and performs only allowed operations in the correct order.
 - `_index.md` updates are idempotent and confined to a managed section.

@@ -72,21 +72,25 @@ def _keywords_for_file(file: FileForClustering) -> set[str]:
 def detect_keyword_clusters(
     files: Iterable[FileForClustering],
     *,
-    min_cluster_size: int,
-) -> list[Cluster]:
+    min_role_cluster_size: int,
+    min_project_cluster_size: int,
+) -> dict[str, list[Cluster]]:
     """
     Deterministic cluster pre-pass: within each folder, treat each (normalized) keyword
     as a candidate cluster label; a cluster's members are files containing that keyword.
+
+    Returns a dict with 'role_clusters' and 'project_clusters'.
     """
-    min_cluster_size = int(min_cluster_size)
-    if min_cluster_size < 2:
-        min_cluster_size = 2
+    min_role_cluster_size = max(2, int(min_role_cluster_size))
+    min_project_cluster_size = max(2, int(min_project_cluster_size))
 
     by_folder: dict[str, list[FileForClustering]] = {}
     for f in files:
         by_folder.setdefault(f.folder_path, []).append(f)
 
-    clusters: list[Cluster] = []
+    role_clusters: list[Cluster] = []
+    project_clusters: list[Cluster] = []
+
     for folder_path, folder_files in sorted(by_folder.items(), key=lambda kv: kv[0].lower()):
         keyword_to_members: dict[str, list[str]] = {}
         for f in sorted(folder_files, key=lambda x: x.file_path.lower()):
@@ -95,9 +99,21 @@ def detect_keyword_clusters(
 
         for kw, members in keyword_to_members.items():
             uniq = sorted(set(members), key=str.lower)
-            if len(uniq) < min_cluster_size:
-                continue
-            clusters.append(Cluster(folder_path=folder_path, label=kw, size=len(uniq), members=uniq))
+            
+            # Heuristic: Role clusters are often identified by keywords like "assessment", "plan", "report", "note", "receipt".
+            # For now, we'll just use the size thresholds and let the planner decide the semantic role.
+            # But we can label them based on size.
+            
+            if len(uniq) >= min_role_cluster_size:
+                role_clusters.append(Cluster(folder_path=folder_path, label=kw, size=len(uniq), members=uniq))
+            
+            if len(uniq) >= min_project_cluster_size:
+                project_clusters.append(Cluster(folder_path=folder_path, label=kw, size=len(uniq), members=uniq))
 
-    clusters.sort(key=lambda c: (-c.size, c.folder_path.lower(), c.label.lower()))
-    return clusters
+    role_clusters.sort(key=lambda c: (-c.size, c.folder_path.lower(), c.label.lower()))
+    project_clusters.sort(key=lambda c: (-c.size, c.folder_path.lower(), c.label.lower()))
+
+    return {
+        "role_clusters": role_clusters,
+        "project_clusters": project_clusters,
+    }

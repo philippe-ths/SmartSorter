@@ -6,43 +6,107 @@
 - Stable folder set that ages well
 - Gradual improvement as more files arrive
 
-## Core idea
-Folder structure should be driven by **strong subtopic clusters**, not just folder size.
+## Core idea: balanced specificity
+You want folders to be:
+- **more specific** when there is a real mini-collection (2+ files that obviously belong together), and
+- **more general** when files are one-offs and only share a broad role (risk assessments, activity plans).
 
-A folder with 20 files can be fine if it stays coherent.
-A folder with 20 files becomes a problem when it contains multiple distinct recurring subtopics.
+This is a two-tier approach:
+1) **Project/Topic folders** (specific, earned)
+2) **Role folders** (general, recurring)
 
-## Stability rules
-- Prefer stable structure over constant re-organisation.
-- Avoid renames by default.
-- Only split when the split is clearly useful and likely to recur.
+## Folder types
 
-## Strong subtopic cluster definition
-A subtopic cluster is “strong” only when all are true:
-1. **Clear theme:** member files share a recognisable role or use (for example, risk assessments).
-2. **Critical mass:** cluster has enough files to justify a folder (default heuristic: dynamic based on total file count, e.g., 2 for small batches, 5 for large).
-3. **Narrower than parent:** the cluster is a subset of the parent theme (Scouts → Risk Assessments).
-4. **Predictable future:** a reasonable person expects more files of this type.
+### 1) Project/Topic folders (specific, earned)
+Use when there is a clear subject/purpose grouping that makes retrieval easier.
 
-## Split behaviour
-When a strong cluster is detected inside a folder:
-- Create a new subfolder inside that folder.
-- Move all cluster members into the new subfolder.
-- Update `_index.md` in both the parent folder and the new subfolder.
+Examples:
+- `Camp Gadgets/` containing both:
+  - `Camp Gadgets.docx`
+  - `RA - Camp Gadgets.docx`
+- `Photographer badge/` containing:
+  - `Photographer badge.gslides`
+  - `Photography Badge.gdoc`
 
-Example:
-- Folder `Scouts/` contains 20 Scouts-related files.
-- 6 files are risk assessments.
-- Create `Scouts/Risk Assessments/`.
-- Move the 6 risk assessment files (and the newly added one) into that subfolder.
+**Creation rule**
+Create a project/topic folder only if all are true:
+- **2+ files** belong together (`--min-project-cluster-size`, default 2)
+- the topic name is clear and stable (“Camp Gadgets”, not “Pizza”)
+- it is not a 1-file folder (hard bias against one-offs)
 
-## Folder creation rules
-Create a new folder only when:
-- no existing folder is a reasonable fit, and
-- the category is recurring (not a one-off), and
-- it passes the critical mass threshold (dynamic or explicit).
+### 2) Role folders (general, recurring)
+Use for broad categories that recur and act as “shock absorbers”.
 
-If the category is not recurring, keep the file in place (`(root)` or current folder).
+Examples:
+- `Risk Assessments/` for risk assessment files that do not belong to a specific project folder
+- `Activity Plans/` for activity plan files that do not belong to a specific project folder
+
+**Creation rule**
+Create a role folder when a role cluster is strong enough to be worth it:
+- `--min-role-cluster-size` default 4 (tuneable)
+- role folders should remain stable and predictable over time
+
+## Precedence rules (how to decide where files go)
+1) **Project/topic folder wins** over role folder when it exists.
+   - If “RA - Camp Gadgets” has a matching “Camp Gadgets” plan, put both in `Camp Gadgets/`.
+2) **Role folder next** for remaining files of that role.
+3) **Leave in root** only when nothing is recurring and creating any folder would be a one-off.
+
+## What “great” looks like (example)
+Target folder `Scouts/` contains risk assessments and activity plans.
+
+Great outcome:
+- `Camp Gadgets/` contains:
+  - `Camp Gadgets.docx`
+  - `RA - Camp Gadgets.docx`
+- `Photographer badge/` contains:
+  - `Photographer badge.gslides`
+  - `Photography Badge.gdoc`
+- `Risk Assessments/` contains remaining RAs without a paired project folder:
+  - `RA - Pizza ovens.docx`
+  - `RA - Water Rockets.docx`
+  - `Scout Olympics RA.gdoc`
+- `Activity Plans/` contains remaining plans:
+  - `Poole Cockle Trail tracing the town’s Heritage.gdoc`
+  - `Scouts MythBusters .gdoc`
+  - `Scouts short Film Evening.gdoc`
+
+## What is acceptable
+If there are no clear mini-collections yet, it is fine to start with role folders:
+- `Risk Assessments/`
+- `Activity Plans/`
+
+When the user adds another related file and a mini-collection becomes obvious (2+ files),
+the system should consider creating a project/topic folder and moving the small set.
+
+This is “specificity by accumulation”, not by guessing.
+
+## What is bad (hard constraints)
+### 1) Too many 1-file folders
+Bad:
+- `Pizza/` containing only `RA - Pizza ovens.docx`
+- `Water Rockets/` containing only `RA - Water Rockets.docx`
+
+Rule:
+- Avoid 1-file folders by default.
+- If a category has 1–3 files forever, it probably should have stayed in a role folder.
+
+### 2) Vague or misleading folders
+Bad:
+- `Admin/` (too vague)
+- `Family activities/` (misleading)
+
+Rule:
+Folder names must pass the predictability test:
+“Could a reasonable human guess this file is in here without reading it?”
+
+### 3) Type buckets or placeholder buckets
+Bad:
+- `Documents/`, `Files/`, `Misc/`
+- `PDFs/`, `Word Docs/`, `Slides/`
+
+Rule:
+Foldering is semantic (topic/purpose/role), not file-type based.
 
 ## Naming rules
 Folder names must:
@@ -53,25 +117,14 @@ Folder names must:
 Avoid names that are:
 - entity-based (people, companies)
 - time-based (years, quarters)
-- vague (“Stuff”, “Misc”, “Important”)
+- subjective (“important”, “urgent”)
 
-### Subfolder naming
-Inside a parent folder, avoid repeating the parent context.
+Inside a parent, avoid repeating the parent:
 - Good: `Scouts/Risk Assessments/`
 - Worse: `Scouts/Scouts Risk Assessments/`
-
-## Budget and granularity
-Humans can only hold so many categories in their head.
-- Prefer a moderate number of folders.
-- Split only when it reduces search time and does not create churn.
-
-## Handling ambiguity
-If no existing folder fits and no strong recurring cluster exists:
-- do not create a new folder
-- keep the file in place (`(root)` or current folder)
 
 ## Success test
 A user should be able to:
 - guess where a new file will go
-- understand folder meanings instantly
+- browse folders and understand them instantly
 - find an item later without learning “AI logic”

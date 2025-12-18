@@ -13,14 +13,20 @@ from .planner import apply_local_plan, build_local_plan
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="ai_folder_sorter")
-    p.add_argument("--local-path", required=True, help="Local folder path to organize (bounded depth).")
+    p.add_argument("--local-path", required=True, help="Local folder path to organize (top-level only).")
     p.add_argument("--max-chars", type=int, default=60000, help="Max chars per extracted preview (default: 60000).")
     p.add_argument("--min-chars", type=int, default=500, help="Minimum extracted text to proceed (default: 500).")
     p.add_argument(
-        "--min-cluster-size",
+        "--min-role-cluster-size",
         type=int,
-        default=0,
-        help="Minimum cluster size to justify a split (default: 0 = auto-dynamic based on file count).",
+        default=4,
+        help="Minimum cluster size for general role folders (default: 4).",
+    )
+    p.add_argument(
+        "--min-project-cluster-size",
+        type=int,
+        default=2,
+        help="Minimum cluster size for specific project/topic folders (default: 2).",
     )
     p.add_argument("--apply", action="store_true", help="Perform writes/moves (prompts first).")
     p.add_argument(
@@ -61,7 +67,8 @@ def main(argv: list[str] | None = None) -> int:
             models=models,
             max_chars=args.max_chars,
             min_chars=args.min_chars,
-            min_cluster_size=args.min_cluster_size,
+            min_role_cluster_size=args.min_role_cluster_size,
+            min_project_cluster_size=args.min_project_cluster_size,
             critic_iterations=args.critic_iterations,
             show_summaries=args.show_summaries,
             logging=args.logging,

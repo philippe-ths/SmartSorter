@@ -119,15 +119,18 @@ def plan_global(*, model: str, planning_snapshot: dict[str, Any], timeout_second
 You generate a single GLOBAL filing plan for a target folder.
 
 Goal:
-- Produce predictable, low-surprise placements and stable folders.
-- Prefer existing folders. Create new folders only when they have strong recurring value.
-- If strong subtopic clusters exist inside a folder, you MAY propose a split by creating a subfolder inside that folder and moving all cluster members.
+- Produce predictable, balanced, and low-surprise placements.
+- Use a two-tier folder taxonomy:
+  1. Project/Topic folders (specific): Use for mini-collections (2+ files) that clearly belong together.
+  2. Role folders (general): Use for broad, recurring categories (e.g., Risk Assessments, Activity Plans) that act as "shock absorbers".
+- Precedence: Project/Topic folder wins over Role folder. If a file belongs to a project mini-collection, put it there even if it also fits a role.
 
 Rules:
 - Do NOT delete anything.
 - Do NOT rename existing folders.
 - Do NOT modify file contents.
 - Do NOT guess from filenames or timestamps; use only the provided planning snapshot (stored profiles and folder context).
+- Avoid 1-file folders. Only create a new folder if it will contain 2+ files (mini-collection) or if it's a strong recurring role.
 - Folder names must be plain-language, stable categories (prefer plural nouns).
 - Avoid entity-based names (people/companies), time-based names (years/quarters), and filetype buckets (PDFs, Images).
 
@@ -159,14 +162,16 @@ def critique_global_plan(
     timeout_seconds: int,
 ) -> dict[str, Any]:
     instruction = """
-You are a critic that checks whether a GLOBAL filing plan is acceptable and low-surprise.
+You are a critic that checks whether a GLOBAL filing plan is acceptable and follows the "Balanced Specificity" taxonomy.
 
 Acceptance guidance:
 - Approve when the plan matches what a reasonable human would expect and avoids churn.
 - Reject when:
-  - the plan creates folders that are too specific, entity-based, time-based, or redundant,
-  - a split is proposed without strong recurring value (cluster too small or not clearly narrower than parent),
-  - moves feel arbitrary or unstable.
+  - the plan creates 1-file folders (hard bias against one-offs),
+  - the plan creates vague or misleading folders (e.g., "Admin", "Documents", "Misc"),
+  - the plan violates precedence (e.g., a file that belongs in a project mini-collection is put in a general role folder instead),
+  - the plan over-splits (too many new folders in one run),
+  - folder names are entity-based, time-based, or filetype-based.
 
 Return strict JSON ONLY:
 {

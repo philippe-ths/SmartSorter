@@ -1,7 +1,14 @@
 # process.md
 
 ## Purpose
-Organise a user-chosen **local** target folder by building and storing semantic profiles for files, then generating a **global plan** that can both place new files and refactor existing folders (splits) when strong subtopic clusters emerge.
+Organise a user-chosen **local** target folder by:
+1) building and storing semantic profiles for each file (summary + keywords),
+2) producing a **global plan** that uses all stored profiles at once,
+3) creating a **balanced** folder structure that is sometimes more specific (when there is a real mini-collection) and sometimes more general (when files are one-offs).
+
+This is designed to avoid both:
+- **folder explosion** (lots of 1-file folders), and
+- **blob folders** (everything dumped into “Documents”).
 
 ## Models (explicit)
 All Google ADK agents use a fast, low-cost model:
@@ -15,7 +22,7 @@ All Google ADK agents use a fast, low-cost model:
 ## 1) Select target folder (local path)
 - User provides a local filesystem path (target folder).
 - Treat a synced “local Google Drive” folder as normal local storage. No Drive APIs.
-- Enforce: operate only within the target folder and its subfolders.
+- Enforce: operate only within the target folder.
 
 **Logging (`--logging`)**
 ```text
@@ -24,33 +31,30 @@ All Google ADK agents use a fast, low-cost model:
 [init] Mode: dry-run (apply=false)
 ```
 
-## 2) Inventory scan (bounded depth)
-- List files in:
-  - the target folder root
-  - each **direct subfolder** of the target folder
-- Do not traverse deeper than 1 folder level.
+## 2) Scan the target folder (top-level only)
+- List only **direct children** of the target folder (no recursion).
+- Split into:
+  - files to process
+  - existing subfolders (candidates for placement)
 
 **Logging (`--logging`)**
 ```text
-[scan] Root files to consider (12):
-  - file1.pdf
-  - file2.txt
-[scan] Direct subfolders (5):
-  - Scouts
-  - Finance
-[scan] Depth-1 files to consider (88)
+[scan] Files to process (12):
+  - RA - Camp Gadgets.docx
+  - Camp Gadgets.docx
+[scan] Existing subfolders (0):
 ```
 
-## 3) Build folder context
-- For each direct subfolder:
+## 3) Build existing folder context
+- For each existing direct subfolder:
   - read `_index.md` if present
   - build a folder profile from folder name + short description from `_index.md`
 
 **Logging (`--logging`)**
 ```text
 [context] Folder profiles (5):
-  - Scouts (index: yes) desc: scouts admin, activities, plans
-  - Finance (index: yes) desc: invoices, tax, banking
+  - Risk Assessments (index: yes) desc: safety/risk docs for activities
+  - Activity Plans (index: yes) desc: plans and instructions for activities
 ```
 
 ## 4) Build or refresh file profiles (store-first)
@@ -74,7 +78,7 @@ All Google ADK agents use a fast, low-cost model:
 
 **Logging (`--logging`)**
 ```text
-[extract] Scouts/risk_assessment_01.pdf method=pdf-text chars=43120 (truncated=false)
+[extract] RA - Camp Gadgets.docx method=docx-text chars=43120 (truncated=false)
 [extract] scan.png method=image chars=0
 [skip] scan.png reason="insufficient extracted text" chars=0 min=500
 ```
@@ -84,12 +88,12 @@ All Google ADK agents use a fast, low-cost model:
   - `summary` (max 200 characters)
   - `subject_label` (max 50 characters)
   - `keywords` (5–8)
-- Save `file_profile` into the local store for future global planning.
+- Save `file_profile` into the local store for global planning.
 
 **Logging (`--logging`)**
 ```text
-[summarise] risk_assessment_01.pdf summary="Risk assessment for Scouts hike activity, hazards and mitigations." subject_label="Scouts risk assessment" keywords=[Scouts, risk, assessment, hike, hazards]
-[store] Upsert profile: Scouts/risk_assessment_01.pdf
+[summarise] RA - Camp Gadgets.docx summary="Risk assessment for Scouts camp gadgets activity." subject_label="Scouts camp gadgets" keywords=[Scouts, risk, assessment, camp, gadgets]
+[store] Upsert profile: RA - Camp Gadgets.docx
 ```
 
 ---
@@ -97,7 +101,7 @@ All Google ADK agents use a fast, low-cost model:
 ## 5) Global planning inputs (using stored profiles)
 - Build a planning snapshot from:
   - all available `file_profile` entries (skipped files are excluded)
-  - current file locations (root and direct subfolders)
+  - current file locations (root and existing subfolders)
   - folder profiles (names + `_index.md` descriptions)
 
 **Logging (`--logging`)**
@@ -106,25 +110,45 @@ All Google ADK agents use a fast, low-cost model:
 [global] Skipped (no usable text): 2
 ```
 
-## 6) Detect strong subtopic clusters (deterministic pre-pass)
-- Compute candidate clusters using stored `keywords` and `subject_label`.
-- Clusters are used as evidence for splits and for more stable folder decisions.
-- Only treat a cluster as “strong” when it meets thresholds (example defaults):
-  - `--min-cluster-size` (default 5)
-  - cluster is semantically narrower than the parent folder theme
+## 6) Detect clusters for balanced specificity (deterministic pre-pass)
+This step produces **evidence** that the planner uses to decide when to be specific vs general.
+
+### 6.1 Detect role clusters (general folders)
+Role clusters are broad, recurring “what kind of document is this?” groupings.
+Examples: risk assessments, activity plans, receipts, meeting notes.
+
+- Use stored `keywords`, `subject_label`, and simple signals (like “RA -” prefixes) to find role clusters.
+- Only treat a role cluster as strong when it meets a threshold:
+  - `--min-role-cluster-size` (default 4)
+
+### 6.2 Detect project/topic clusters (specific folders)
+Project/topic clusters are “mini-collections” like **Camp Gadgets** or **Photographer badge**.
+
+- A project/topic cluster is eligible when:
+  - `--min-project-cluster-size` (default 2), and
+  - the files share a clear topic/purpose label, and
+  - it would contain more than one file (hard bias against 1-file folders).
+
+### 6.3 Precedence rule (important)
+If a file belongs to a project/topic cluster that will get its own folder, **that placement wins** over a general role folder.
+Example: “RA - Camp Gadgets” goes to `Camp Gadgets/` (with its paired plan) rather than `Risk Assessments/`.
 
 **Logging (`--logging`)**
 ```text
-[cluster] Folder=Scouts strong_clusters=1
-[cluster]  - "Risk Assessments" size=6 members=[risk_assessment_01.pdf, ...]
+[cluster] Role clusters:
+  - Risk Assessments size=4
+  - Activity Plans size=6
+[cluster] Project/topic clusters:
+  - Camp Gadgets size=2 members=[Camp Gadgets.docx, RA - Camp Gadgets.docx]
+  - Photographer badge size=2 members=[Photographer badge.gslides, Photography Badge.gdoc]
 ```
 
 ## 7) Generate a global plan with Google ADK (Planning Agent)
-- Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to produce a global `plan`.
-- The plan must consider:
-  - existing folders first
-  - whether strong clusters justify creating a new (sub)folder and moving a set of files
-  - avoiding surprise and over-specific folder creation
+- Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to propose a global plan that:
+  - reuses existing folders first,
+  - creates **role folders** when role clusters are strong,
+  - creates **project/topic folders** when a mini-collection exists,
+  - avoids creating one-off folders.
 
 ### 7.1 Plan output schema (global)
 The plan outputs actions and per-file destinations.
@@ -142,41 +166,40 @@ Save the plan (including per-file rationale) into the local store.
 **Logging (`--logging`)**
 ```text
 [plan] Proposed actions:
-  - create_folder: Scouts/Risk Assessments
-  - move_file: Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/ (reason="Risk assessment cluster within Scouts")
-  - move_file: (new) risk_assessment_06.pdf -> Scouts/Risk Assessments/
+  - create_folder: Camp Gadgets
+  - create_folder: Photographer badge
+  - create_folder: Risk Assessments
+  - create_folder: Activity Plans
+  - move_file: RA - Camp Gadgets.docx -> Camp Gadgets/ (reason="paired plan + RA mini-collection")
+  - move_file: RA - Pizza ovens.docx -> Risk Assessments/ (reason="risk assessment role; no paired project folder")
 [plan] File decisions saved to store
 ```
 
 ---
 
 ## 8) Critic loop (global plan review)
-- Purpose: reduce surprising refactors and prevent over-splitting.
+- Purpose: prevent folder explosion, bad names, and surprising splits.
 - Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to critique the **global** plan.
-- Critic output JSON:
-  - `acceptable: true/false`
-  - `critique_rationale`
-  - `suggested_adjustments[]` (optional), such as:
-    - “do not create folder, cluster too small”
-    - “use existing folder instead of new folder”
-    - “keep files in place for stability”
+
+Critic checks (minimum set):
+- Are we creating any 1-file folders?
+- Are we creating vague/misleading folders (Admin, Family activities, Documents)?
+- Are we over-splitting (too many new folders in one run)?
+- Are we violating precedence (project folder should win over role folder when it exists)?
 
 **Logging (`--logging`)**
 ```text
-[critic] acceptable=false rationale="Split is reasonable, but naming should avoid repeating parent. Prefer Scouts/Risk Assessments."
+[critic] acceptable=true rationale="Balanced: project mini-collections extracted; remaining files grouped into role folders."
 ```
 
 ### 8.1 Repair pass (only if critic rejects)
-- Run the Repair Agent (same model) with:
-  - the original plan
-  - the critic feedback
-- Produce a revised plan, then re-run the critic.
-- Repeat up to `--critic-iterations` (default 1–2).
+- Run the Repair Agent with the plan + critic feedback.
+- Re-run critic up to `--critic-iterations` (default 1–2).
 
 **Logging (`--logging`)**
 ```text
-[repair] iter=1 updated plan: rename new folder to Scouts/Risk Assessments
-[critic] iter=1 acceptable=true rationale="Folder split is useful and stable"
+[repair] iter=1 removed one-off folder: Pizza/
+[critic] iter=1 acceptable=true rationale="Avoided single-file folder; kept item in Risk Assessments."
 ```
 
 ---
@@ -191,10 +214,13 @@ Save the plan (including per-file rationale) into the local store.
 **Logging (`--logging`)**
 ```text
 [exec] Create folders:
-  - Scouts/Risk Assessments
+  - Camp Gadgets/
+  - Photographer badge/
+  - Risk Assessments/
+  - Activity Plans/
 [exec] Moves:
-  - Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/
-  - risk_assessment_06.pdf -> Scouts/Risk Assessments/
+  - RA - Camp Gadgets.docx -> Camp Gadgets/
+  - Camp Gadgets.docx -> Camp Gadgets/
 [exec] Skipped:
   - scan.png (insufficient extracted text)
 ```
@@ -209,11 +235,10 @@ Save the plan (including per-file rationale) into the local store.
 
 **Logging (`--logging`)**
 ```text
-[apply] Create folder: Scouts/Risk Assessments/
-[apply] Move: Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/
-[apply] Update index: Scouts/_index.md (managed section)
-[apply] Update index: Scouts/Risk Assessments/_index.md (managed section)
-[store] Mark applied: Scouts/risk_assessment_01.pdf -> Scouts/Risk Assessments/
+[apply] Create folder: Camp Gadgets/
+[apply] Move: RA - Camp Gadgets.docx -> Camp Gadgets/
+[apply] Update index: Camp Gadgets/_index.md (managed section)
+[store] Mark applied: RA - Camp Gadgets.docx -> Camp Gadgets/
 ```
 
 ## 11) Final report
@@ -224,7 +249,7 @@ Save the plan (including per-file rationale) into the local store.
 [done] Inventory: 100 files
 [done] Profiled: 98
 [done] Skipped: 2 (insufficient extracted text)
-[done] Moves applied: 6
-[done] Folders created: 1
-[done] Index updated: 2
+[done] Moves applied: 14
+[done] Folders created: 4
+[done] Index updated: 4
 ```

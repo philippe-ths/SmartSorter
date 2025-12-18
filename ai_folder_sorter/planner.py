@@ -81,15 +81,14 @@ def _extract_text(path: Path, *, max_chars: int) -> tuple[str, dict[str, Any]]:
 
 def _list_bounded_inventory(
     target: Path,
-    *,
-    include_depth2: bool = True,
 ) -> tuple[list[Path], list[Path]]:
     """
     Returns (files, folders), both absolute Paths.
 
-    Bounded traversal:
-    - Always includes: files in target root, and files in each direct subfolder.
-    - If include_depth2: includes files in each direct subfolder's direct subfolders.
+    Top-level only:
+    - Includes files in target root.
+    - Includes direct subfolders (as candidates for placement).
+    - Does NOT traverse into subfolders.
     """
     files: list[Path] = []
     folders: list[Path] = []
@@ -106,18 +105,6 @@ def _list_bounded_inventory(
         if is_ignorable_file_name(child.name):
             continue
         folders.append(child)
-
-        for p in sorted(child.iterdir(), key=lambda p: p.name.lower()):
-            if p.is_file():
-                if not is_ignorable_file_name(p.name):
-                    files.append(p)
-            elif include_depth2 and p.is_dir():
-                if is_ignorable_file_name(p.name) or p.name == STORE_DIR_NAME:
-                    continue
-                folders.append(p)
-                for q in sorted(p.iterdir(), key=lambda q: q.name.lower()):
-                    if q.is_file() and not is_ignorable_file_name(q.name):
-                        files.append(q)
 
     return files, folders
 
@@ -247,7 +234,8 @@ def build_local_plan(
     models: adk_agents.Models,
     max_chars: int,
     min_chars: int,
-    min_cluster_size: int,
+    min_role_cluster_size: int,
+    min_project_cluster_size: int,
     critic_iterations: int,
     show_summaries: bool,
     logging: bool,
@@ -266,22 +254,19 @@ def build_local_plan(
     )
     _log(logging, "[init] Mode: dry-run (apply=false)")
 
-    inventory_files, inventory_folders = _list_bounded_inventory(target, include_depth2=True)
+    inventory_files, inventory_folders = _list_bounded_inventory(target)
     inventory_rel = [_rel_posix(target, p) for p in inventory_files]
     inventory_rel_set = set(inventory_rel)
 
-    root_files = [p for p in inventory_rel if "/" not in p]
-    _log(logging, f"[scan] Root files to consider ({len(root_files)}):")
-    for p in sorted(root_files, key=str.lower)[:80]:
+    _log(logging, f"[scan] Files to process ({len(inventory_files)}):")
+    for p in sorted(inventory_rel, key=str.lower)[:80]:
         _log(logging, f"  - {p}")
-    if len(root_files) > 80:
-        _log(logging, f"  - ... ({len(root_files) - 80} more)")
+    if len(inventory_rel) > 80:
+        _log(logging, f"  - ... ({len(inventory_rel) - 80} more)")
 
-    direct_subfolders = [p for p in inventory_folders if p.parent == target]
-    _log(logging, f"[scan] Direct subfolders ({len(direct_subfolders)}):")
-    for d in sorted(direct_subfolders, key=lambda p: p.name.lower()):
+    _log(logging, f"[scan] Existing subfolders ({len(inventory_folders)}):")
+    for d in sorted(inventory_folders, key=lambda p: p.name.lower()):
         _log(logging, f"  - {d.name}")
-    _log(logging, f"[scan] Depth-1+ files to consider ({len(inventory_files)})")
 
     folder_profiles = _folder_profiles(target, inventory_folders)
     if logging:
@@ -413,39 +398,36 @@ def build_local_plan(
     _log(logging, f"[global] Files with profiles: {len(files_for_planning)}")
     _log(logging, f"[global] Skipped (no usable text): {len(skipped)}")
 
-    # Dynamic cluster sizing if set to 0 (auto)
-    effective_min_cluster = min_cluster_size
-    if effective_min_cluster <= 0:
-        n_files = len(files_for_planning)
-        if n_files < 20:
-            effective_min_cluster = 2
-        elif n_files < 100:
-            effective_min_cluster = 3
-        else:
-            effective_min_cluster = 5
-        _log(logging, f"[cluster] Dynamic sizing: n={n_files} -> min_cluster_size={effective_min_cluster}")
+    clusters_dict = detect_keyword_clusters(
+        files_for_cluster,
+        min_role_cluster_size=min_role_cluster_size,
+        min_project_cluster_size=min_project_cluster_size,
+    )
+    role_clusters = clusters_dict["role_clusters"]
+    project_clusters = clusters_dict["project_clusters"]
 
-    clusters = detect_keyword_clusters(files_for_cluster, min_cluster_size=effective_min_cluster)
     if logging:
-        by_folder: dict[str, list[dict[str, Any]]] = {}
-        for c in clusters:
-            by_folder.setdefault(c.folder_path, []).append({"label": c.label, "size": c.size, "members": c.members})
-        for folder_path, cs in list(by_folder.items())[:30]:
-            _log(logging, f"[cluster] Folder={folder_path} strong_clusters={len(cs)}")
-            for c in cs[:3]:
-                _log(logging, f'  - "{c["label"]}" size={c["size"]}')
+        _log(logging, "[cluster] Role clusters:")
+        for c in role_clusters[:5]:
+            _log(logging, f'  - "{c.label}" size={c.size}')
+        _log(logging, "[cluster] Project/topic clusters:")
+        for c in project_clusters[:5]:
+            _log(logging, f'  - "{c.label}" size={c.size}')
 
     planning_snapshot: dict[str, Any] = {
         "target": str(target),
         "rules": {
             "no_deletions": True,
             "no_renames": True,
-            "bounded_depth": 2,
-            "min_cluster_size": int(effective_min_cluster),
+            "top_level_only": True,
+            "min_role_cluster_size": int(min_role_cluster_size),
+            "min_project_cluster_size": int(min_project_cluster_size),
+            "precedence": "project_topic_folder_wins_over_role_folder",
         },
         "folders": [{"folder_path": f.folder_path, "name": f.name, "desc": f.desc, "has_index": f.has_index} for f in folder_profiles],
         "files": files_for_planning,
-        "clusters": [asdict(c) for c in clusters[:100]],
+        "role_clusters": [asdict(c) for c in role_clusters[:50]],
+        "project_clusters": [asdict(c) for c in project_clusters[:50]],
     }
 
     plan_raw = adk_agents.plan_global(model=models.planner, planning_snapshot=planning_snapshot, timeout_seconds=adk_timeout_seconds)
