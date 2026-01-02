@@ -6,6 +6,27 @@ This guide consolidates **principles**, **best practices**, and **copy/paste cod
 
 ---
 
+## SmartSorter-Specific Notes
+
+In this project, LLM prompts are centralized in `ai_folder_sorter/prompts.py`. The prompts module provides:
+
+- `SUMMARIZE_FILE` — file summarization prompt
+- `PLAN_GLOBAL` — global planning prompt
+- `CRITIQUE_GLOBAL_PLAN` — critic prompt for plan review
+- `REPAIR_GLOBAL_PLAN` — repair prompt for fixing rejected plans
+
+Agent wrappers in `ai_folder_sorter/adk_agents.py` use these prompts and include:
+- Retry logic with exponential backoff (3 retries)
+- Markdown code block stripping for model responses
+- Consistent JSON parsing and validation
+
+When modifying prompts:
+1. Edit the prompt constants in `prompts.py`
+2. Run `python -m compileall ai_folder_sorter` to check syntax
+3. Test with `python -m ai_folder_sorter --local-path /path --show-summaries --logging`
+
+---
+
 ## 1) Core concepts (mental model)
 
 ### Agents

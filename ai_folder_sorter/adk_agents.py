@@ -2,21 +2,30 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from google import genai
 
+from .prompts import CRITIQUE_GLOBAL_PLAN, PLAN_GLOBAL, REPAIR_GLOBAL_PLAN, SUMMARIZE_FILE
+
 
 @dataclass(frozen=True)
 class Models:
+    """Model configuration for different agent roles."""
     summariser: str
     critic: str
     planner: str
     repair: str
 
 
+# =============================================================================
+# LLM Client and Retry Logic
+# =============================================================================
+
 def _client(*, timeout_seconds: int) -> genai.Client:
+    """Create a Gemini client with the specified timeout."""
     # google-genai expects http_options.timeout in milliseconds (min 10s enforced server-side).
     timeout_ms = max(int(timeout_seconds) * 1000, 10_000)
     api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
@@ -25,29 +34,9 @@ def _client(*, timeout_seconds: int) -> genai.Client:
     return genai.Client(http_options={"timeout": timeout_ms})
 
 
-def _call_json(model: str, instruction: str, payload: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
-    client = _client(timeout_seconds=timeout_seconds)
-    prompt = instruction.strip() + "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
-    try:
-        resp = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-            },
-        )
-    except Exception as e:
-        msg = str(e)
-        if "API key not valid" in msg or "API_KEY_INVALID" in msg:
-            raise RuntimeError(
-                "Gemini API key is invalid. Set a valid `GOOGLE_API_KEY`, or configure ADC/Vertex auth for `google-genai`."
-            ) from e
-        raise RuntimeError(f"LLM call failed: {e}") from e
-    text = (resp.text or "").strip()
-    if not text:
-        raise RuntimeError("Empty model response.")
-    
-    # Strip markdown code blocks if present
+def _strip_markdown_code_block(text: str) -> str:
+    """Strip markdown code block wrappers if present."""
+    text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
         if lines and lines[0].startswith("```"):
@@ -55,40 +44,117 @@ def _call_json(model: str, instruction: str, payload: dict[str, Any], timeout_se
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines).strip()
+    return text
 
-    try:
-        return json.loads(text)
-    except Exception as e:
-        raise RuntimeError(f"Model returned non-JSON: {text[:500]}") from e
+
+def _call_json(
+    model: str,
+    instruction: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+    *,
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+) -> dict[str, Any]:
+    """
+    Call the LLM and parse JSON response with retry logic.
+    
+    Args:
+        model: The model identifier
+        instruction: The system instruction
+        payload: The input payload to send as JSON
+        timeout_seconds: Timeout for the request
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay between retries (exponential backoff)
+        
+    Returns:
+        Parsed JSON response as a dict
+        
+    Raises:
+        RuntimeError: If all retries fail or response is invalid
+    """
+    client = _client(timeout_seconds=timeout_seconds)
+    prompt = instruction.strip() + "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
+    
+    last_error: Optional[Exception] = None
+    
+    for attempt in range(max_retries):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                },
+            )
+            
+            text = (resp.text or "").strip()
+            if not text:
+                raise RuntimeError("Empty model response.")
+            
+            # Strip markdown code blocks if present (model sometimes ignores response_mime_type)
+            text = _strip_markdown_code_block(text)
+            
+            try:
+                result = json.loads(text)
+                # Handle single-element array wrapping
+                if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
+                    result = result[0]
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"Expected object, got {type(result).__name__}")
+                return result
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Model returned non-JSON: {text[:500]}") from e
+                
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            
+            # Don't retry on API key errors
+            if "API key not valid" in msg or "API_KEY_INVALID" in msg:
+                raise RuntimeError(
+                    "Gemini API key is invalid. Set a valid `GOOGLE_API_KEY`, or configure ADC/Vertex auth for `google-genai`."
+                ) from e
+            
+            # Don't retry on the last attempt
+            if attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)
+                time.sleep(delay)
+                continue
+            
+            raise RuntimeError(f"LLM call failed after {max_retries} attempts: {e}") from e
+    
+    # Should never reach here, but satisfy type checker
+    raise RuntimeError(f"LLM call failed: {last_error}")
 
 
 def summarize_file(*, model: str, file_name: str, text: str, timeout_seconds: int) -> dict[str, Any]:
-    instruction = """
-You summarise a file into a strict JSON object with keys:
-- summary: string, max 200 characters
-- subject_label: string, max 50 characters
-- keywords: array of 5 to 8 short words/phrases
-
-Rules:
-- Base the result ONLY on the provided extracted text. Do not guess from file name, path, or metadata.
-- Keep it concise and factual.
-- Return JSON only.
-""".strip()
-    out = _call_json(model, instruction, {"file_name": file_name, "text": text}, timeout_seconds=timeout_seconds)
-    if isinstance(out, list) and len(out) == 1 and isinstance(out[0], dict):
-        out = out[0]
-    summary = str(out.get("summary", "")).strip()
-    subject_label = str(out.get("subject_label", "")).strip()
+    """
+    Summarize a file's content using LLM.
+    
+    Args:
+        model: The model identifier to use
+        file_name: Name of the file being summarized
+        text: Extracted text content from the file
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        Dict with 'summary', 'subject_label', and 'keywords' keys
+    """
+    out = _call_json(
+        model,
+        SUMMARIZE_FILE.instruction,
+        {"file_name": file_name, "text": text},
+        timeout_seconds=timeout_seconds,
+    )
+    
+    summary = str(out.get("summary", "")).strip()[:200]
+    subject_label = str(out.get("subject_label", "")).strip()[:50]
     keywords = out.get("keywords") or []
     if not isinstance(keywords, list):
         keywords = []
-    keywords = [str(k).strip() for k in keywords if str(k).strip()]
-    summary = summary[:200]
-    subject_label = subject_label[:50]
-    if len(keywords) < 5:
-        keywords = keywords[:8]
-    else:
-        keywords = keywords[:8]
+    keywords = [str(k).strip() for k in keywords if str(k).strip()][:8]
+    
     return {"summary": summary, "subject_label": subject_label, "keywords": keywords}
 
 
@@ -115,43 +181,23 @@ def critique_plan(
 
 
 def plan_global(*, model: str, planning_snapshot: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
-    instruction = """
-You generate a single GLOBAL filing plan for a target folder.
-
-Goal:
-- Produce predictable, balanced, and low-surprise placements.
-- Use a two-tier folder taxonomy:
-  1. Project/Topic folders (specific): Use for mini-collections (2+ files) that clearly belong together.
-  2. Role folders (general): Use for broad, recurring categories (e.g., Risk Assessments, Activity Plans) that act as "shock absorbers".
-- Precedence: Project/Topic folder wins over Role folder. If a file belongs to a project mini-collection, put it there even if it also fits a role.
-
-Rules:
-- Do NOT delete anything.
-- Do NOT rename existing folders.
-- Do NOT modify file contents.
-- Do NOT guess from filenames or timestamps; use only the provided planning snapshot (stored profiles and folder context).
-- Avoid 1-file folders. Only create a new folder if it will contain 2+ files (mini-collection) or if it's a strong recurring role.
-- Folder names must be plain-language, stable categories (prefer plural nouns).
-- Avoid entity-based names (people/companies), time-based names (years/quarters), and filetype buckets (PDFs, Images).
-
-Return strict JSON ONLY with this schema:
-{
-  "actions": [
-    {"kind": "create_folder", "path": "Folder/Subfolder", "index_desc": "..." | null},
-    {"kind": "move_file", "from": "rel/path/to/file.ext", "to_folder": "Folder/Subfolder" | "(root)", "rationale": "..."},
-    {"kind": "update_index", "folder_path": "Folder/Subfolder"}
-  ],
-  "file_decisions": [
-    {"file_path": "rel/path/to/file.ext", "destination_folder_path": "Folder/Subfolder" | "(root)", "rationale": "..."}
-  ]
-}
-""".strip()
-    out = _call_json(model, instruction, planning_snapshot, timeout_seconds=timeout_seconds)
-    if isinstance(out, list) and len(out) == 1 and isinstance(out[0], dict):
-        out = out[0]
-    if not isinstance(out, dict):
-        raise RuntimeError(f"Expected object, got {type(out).__name__}")
-    return out
+    """
+    Generate a global filing plan for the target folder.
+    
+    Args:
+        model: The model identifier to use
+        planning_snapshot: The complete planning context
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        A dict with 'actions' and 'file_decisions' keys
+    """
+    return _call_json(
+        model,
+        PLAN_GLOBAL.instruction,
+        planning_snapshot,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def critique_global_plan(
@@ -161,40 +207,24 @@ def critique_global_plan(
     plan: dict[str, Any],
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    instruction = """
-You are a critic that checks whether a GLOBAL filing plan is acceptable and follows the "Balanced Specificity" taxonomy.
-
-Acceptance guidance:
-- Approve when the plan matches what a reasonable human would expect and avoids churn.
-- Reject when:
-  - the plan creates 1-file folders (hard bias against one-offs),
-  - the plan creates vague or misleading folders (e.g., "Admin", "Documents", "Misc"),
-  - the plan violates precedence (e.g., a file that belongs in a project mini-collection is put in a general role folder instead),
-  - the plan over-splits (too many new folders in one run),
-  - folder names are entity-based, time-based, or filetype-based.
-
-Return strict JSON ONLY:
-{
-  "acceptable": true|false,
-  "critique_rationale": "...",
-  "suggested_adjustments": [
-    {"kind": "remove_action", "action_index": 0, "reason": "..."},
-    {"kind": "rename_new_folder", "old_path": "A/B", "new_path": "A/C", "reason": "..."},
-    {"kind": "change_destination", "file_path": "rel/path.ext", "new_destination_folder_path": "(root)" | "X/Y", "reason": "..."}
-  ] | null
-}
-""".strip()
-    out = _call_json(
+    """
+    Critique a global filing plan.
+    
+    Args:
+        model: The model identifier to use
+        planning_snapshot: The planning context
+        plan: The plan to critique
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        A dict with 'acceptable', 'critique_rationale', and optional 'suggested_adjustments'
+    """
+    return _call_json(
         model,
-        instruction,
+        CRITIQUE_GLOBAL_PLAN.instruction,
         {"planning_snapshot": planning_snapshot, "plan": plan},
         timeout_seconds=timeout_seconds,
     )
-    if isinstance(out, list) and len(out) == 1 and isinstance(out[0], dict):
-        out = out[0]
-    if not isinstance(out, dict):
-        raise RuntimeError(f"Expected object, got {type(out).__name__}")
-    return out
 
 
 def repair_global_plan(
@@ -205,34 +235,22 @@ def repair_global_plan(
     critique: dict[str, Any],
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    instruction = """
-You repair a GLOBAL filing plan using critic feedback.
-
-Inputs:
-- planning_snapshot (context)
-- plan (original plan)
-- critique (critic feedback with suggested_adjustments)
-
-Output:
-- Return a revised plan with the exact same schema as the original plan:
-{
-  "actions": [...],
-  "file_decisions": [...]
-}
-
-Rules:
-- Apply critic guidance where reasonable.
-- Keep changes minimal while making the plan acceptable and low-surprise.
-- Return JSON only.
-""".strip()
-    out = _call_json(
+    """
+    Repair a global filing plan based on critic feedback.
+    
+    Args:
+        model: The model identifier to use
+        planning_snapshot: The planning context
+        plan: The original plan
+        critique: The critic's feedback
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        A revised plan with the same schema as the original
+    """
+    return _call_json(
         model,
-        instruction,
+        REPAIR_GLOBAL_PLAN.instruction,
         {"planning_snapshot": planning_snapshot, "plan": plan, "critique": critique},
         timeout_seconds=timeout_seconds,
     )
-    if isinstance(out, list) and len(out) == 1 and isinstance(out[0], dict):
-        out = out[0]
-    if not isinstance(out, dict):
-        raise RuntimeError(f"Expected object, got {type(out).__name__}")
-    return out

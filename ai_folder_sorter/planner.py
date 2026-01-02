@@ -8,75 +8,37 @@ from typing import Any, Optional
 
 from . import adk_agents
 from .clustering import FileForClustering, detect_keyword_clusters
+from .extractor import ExtractedContent, extract_text
 from .models import Action, FolderProfile
+from .paths import FolderPath, normalize_folder_path, rel_posix, safe_join_under_target
 from .store import STORE_DIR_NAME, load_profiles, mark_applied_destination, move_profile_entry, save_latest_plan, save_profiles, upsert_profile, is_unchanged
 from .utils import (
-    extract_docx_text,
-    extract_pdf_text,
-    extract_xlsx_text,
     is_ignorable_file_name,
     managed_index_update,
-    read_text_file,
     sanitize_folder_name,
     sniff_mime_type,
 )
 
 
 def _log(enabled: bool, msg: str) -> None:
+    """Log a message if logging is enabled."""
     if enabled:
         print(msg, flush=True)
 
 
-def _rel_posix(target: Path, path: Path) -> str:
-    return path.relative_to(target).as_posix()
-
-
 def _folder_path_for_rel(rel_path: str) -> str:
-    rel_path = rel_path.replace("\\", "/").lstrip("/")
-    if "/" not in rel_path:
-        return "(root)"
-    return rel_path.rsplit("/", 1)[0]
+    """Extract the folder portion from a relative file path."""
+    return FolderPath.from_rel_file_path(rel_path).value
 
 
 def _sanitize_folder_path(path: str) -> str:
-    raw = (path or "").strip()
-    if raw in {"", ".", "(root)"}:
-        return "(root)"
-    parts = [p for p in raw.replace("\\", "/").split("/") if p and p not in {".", ".."}]
-    safe = [sanitize_folder_name(p) for p in parts]
-    return "/".join(safe)
+    """Sanitize and normalize a folder path."""
+    return normalize_folder_path(path)
 
 
-def _safe_join_under_target(target: Path, rel_path: str) -> Path:
-    rel_path = rel_path.replace("\\", "/").lstrip("/")
-    p = (target / rel_path).resolve()
-    target_resolved = target.resolve()
-    if target_resolved == p or target_resolved in p.parents:
-        return p
-    raise ValueError(f"Path escapes target: {rel_path}")
-
-
-def _extract_text(path: Path, *, max_chars: int) -> tuple[str, dict[str, Any]]:
-    ext = path.suffix.lower()
-
-    if ext == ".pdf":
-        text, truncated = extract_pdf_text(path, max_chars=max_chars)
-        return text, {"method": "pdf-text", "truncated": truncated, "is_full_content": not truncated}
-
-    if ext in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-        text, truncated = extract_xlsx_text(path, max_chars=max_chars)
-        return text, {"method": "xlsx-cells", "truncated": truncated, "is_full_content": not truncated}
-
-    if ext == ".docx":
-        text, truncated = extract_docx_text(path, max_chars=max_chars)
-        return text, {"method": "docx-text", "truncated": truncated, "is_full_content": not truncated}
-
-    if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".tiff", ".bmp", ".heic"}:
-        return "", {"method": "image", "truncated": False, "is_full_content": False}
-
-    text, truncated = read_text_file(path, max_chars=max_chars)
-    # If we read the whole file (not truncated), treat it as full content even if it is short.
-    return text, {"method": "text", "truncated": truncated, "is_full_content": not truncated}
+def _extract_file_text(path: Path, *, max_chars: int) -> ExtractedContent:
+    """Extract text content from a file using the appropriate extractor."""
+    return extract_text(path, max_chars=max_chars)
 
 
 def _list_bounded_inventory(
@@ -110,18 +72,19 @@ def _list_bounded_inventory(
 
 
 def _folder_profiles(target: Path, folders: list[Path], *, max_index_chars: int = 800) -> list[FolderProfile]:
+    """Build folder profile objects from existing folders."""
     profiles: list[FolderProfile] = []
-    for folder in sorted(folders, key=lambda p: _rel_posix(target, p).lower()):
+    for folder in sorted(folders, key=lambda p: rel_posix(target, p).lower()):
         idx = folder / "_index.md"
         if idx.exists() and idx.is_file():
             raw = idx.read_text(encoding="utf-8", errors="ignore")
             desc = raw.strip().splitlines()[0:5]
             desc_text = " ".join([x.strip() for x in desc if x.strip()])[:max_index_chars] or None
             profiles.append(
-                FolderProfile(folder_path=_rel_posix(target, folder), name=folder.name, desc=desc_text, has_index=True)
+                FolderProfile(folder_path=rel_posix(target, folder), name=folder.name, desc=desc_text, has_index=True)
             )
         else:
-            profiles.append(FolderProfile(folder_path=_rel_posix(target, folder), name=folder.name, desc=None, has_index=False))
+            profiles.append(FolderProfile(folder_path=rel_posix(target, folder), name=folder.name, desc=None, has_index=False))
     return profiles
 
 
@@ -171,7 +134,7 @@ def _human_summary(*, moves: list[dict[str, str]], created_folders: list[str], s
     return "".join(lines).strip()
 
 
-def _normalize_plan(*, plan: dict[str, Any], inventory_rel_paths: set[str]) -> dict[str, Any]:
+def _normalize_plan(*, plan: dict[str, Any], inventory_rel_paths: set[str], existing_folders: set[str]) -> dict[str, Any]:
     actions = plan.get("actions") or []
     file_decisions = plan.get("file_decisions") or []
 
@@ -181,6 +144,8 @@ def _normalize_plan(*, plan: dict[str, Any], inventory_rel_paths: set[str]) -> d
         file_decisions = []
 
     norm_actions: list[dict[str, Any]] = []
+    created_folders: set[str] = set()
+    
     for a in actions:
         if not isinstance(a, dict):
             continue
@@ -189,6 +154,7 @@ def _normalize_plan(*, plan: dict[str, Any], inventory_rel_paths: set[str]) -> d
             p = _sanitize_folder_path(str(a.get("path") or ""))
             if p == "(root)":
                 continue
+            created_folders.add(p)
             norm_actions.append({"kind": "create_folder", "path": p, "index_desc": (str(a.get("index_desc") or "").strip() or None)})
         elif kind == "move_file":
             src = str(a.get("from") or "").replace("\\", "/").lstrip("/")
@@ -216,11 +182,23 @@ def _normalize_plan(*, plan: dict[str, Any], inventory_rel_paths: set[str]) -> d
         fp = str(d.get("file_path") or "").replace("\\", "/").lstrip("/")
         if not fp or fp not in inventory_rel_paths:
             continue
+        
+        current_folder = _sanitize_folder_path(str(d.get("current_folder_path") or _folder_path_for_rel(fp)))
         dest = _sanitize_folder_path(str(d.get("destination_folder_path") or "(root)"))
+        
+        # Compute derived fields
+        dest_exists = dest == "(root)" or dest in existing_folders
+        dest_will_be_created = dest in created_folders
+        move_required = current_folder != dest
+        
         norm_decisions.append(
             {
                 "file_path": fp,
+                "current_folder_path": current_folder,
                 "destination_folder_path": dest,
+                "destination_folder_exists": dest_exists,
+                "destination_folder_will_be_created": dest_will_be_created,
+                "move_required": move_required,
                 "rationale": str(d.get("rationale") or "").strip() or "No rationale provided.",
             }
         )
@@ -255,7 +233,7 @@ def build_local_plan(
     _log(logging, "[init] Mode: dry-run (apply=false)")
 
     inventory_files, inventory_folders = _list_bounded_inventory(target)
-    inventory_rel = [_rel_posix(target, p) for p in inventory_files]
+    inventory_rel = [rel_posix(target, p) for p in inventory_files]
     inventory_rel_set = set(inventory_rel)
 
     _log(logging, f"[scan] Files to process ({len(inventory_files)}):")
@@ -269,6 +247,7 @@ def build_local_plan(
         _log(logging, f"  - {d.name}")
 
     folder_profiles = _folder_profiles(target, inventory_folders)
+    existing_folders_set = {fp.folder_path for fp in folder_profiles}
     if logging:
         _log(logging, f"[context] Folder profiles ({len(folder_profiles)}):")
         for fp in folder_profiles[:80]:
@@ -279,7 +258,7 @@ def build_local_plan(
     cached = 0
     needs = 0
     for p in inventory_files:
-        rel = _rel_posix(target, p)
+        rel = rel_posix(target, p)
         existing = profiles.get(rel)
         if existing and is_unchanged(existing=existing, path=p):
             cached += 1
@@ -287,13 +266,27 @@ def build_local_plan(
             needs += 1
     _log(logging, f"[store] Loaded profiles: {len(profiles)}")
     _log(logging, f"[store] Needs summarise: {needs} (cached={cached})")
+    
+    # Show cached profiles when logging is enabled
+    if logging and profiles:
+        _log(logging, "[store] Cached file profiles:")
+        for rel_path, prof in sorted(profiles.items(), key=lambda x: x[0].lower()):
+            if prof.skipped_reason:
+                _log(logging, f'  - {rel_path}: [SKIPPED] reason="{prof.skipped_reason}"')
+            else:
+                kw_str = ", ".join(prof.keywords[:5]) if prof.keywords else "(none)"
+                summary_preview = (prof.summary[:60] + "...") if len(prof.summary) > 60 else prof.summary
+                _log(logging, f'  - {rel_path}:')
+                _log(logging, f'      summary: "{summary_preview}"')
+                _log(logging, f'      subject: "{prof.subject_label}"')
+                _log(logging, f'      keywords: [{kw_str}]')
 
     skipped: list[dict[str, Any]] = []
     files_for_planning: list[dict[str, Any]] = []
     files_for_cluster: list[FileForClustering] = []
 
-    for p in sorted(inventory_files, key=lambda x: _rel_posix(target, x).lower()):
-        rel = _rel_posix(target, p)
+    for p in sorted(inventory_files, key=lambda x: rel_posix(target, x).lower()):
+        rel = rel_posix(target, p)
         mime = sniff_mime_type(p)
         existing = profiles.get(rel)
 
@@ -323,12 +316,11 @@ def build_local_plan(
             )
             continue
 
-        text, meta = _extract_text(p, max_chars=max_chars)
-        text_chars = len(text)
-        _log(logging, f"[extract] {rel} method={meta.get('method')} chars={text_chars} (truncated={bool(meta.get('truncated'))})")
+        extracted = _extract_file_text(p, max_chars=max_chars)
+        text_chars = extracted.char_count
+        _log(logging, f"[extract] {rel} method={extracted.method} chars={text_chars} (truncated={extracted.truncated})")
 
-        is_full_content = bool(meta.get("is_full_content"))
-        if text_chars < min_chars and not is_full_content:
+        if text_chars < min_chars and not extracted.is_full_content:
             reason = "insufficient extracted text"
             _log(logging, f'[skip] {rel} reason="{reason}" chars={text_chars} min={min_chars}')
             upsert_profile(
@@ -348,7 +340,7 @@ def build_local_plan(
         summary_obj = adk_agents.summarize_file(
             model=models.summariser,
             file_name=p.name,
-            text=text,
+            text=extracted.text,
             timeout_seconds=adk_timeout_seconds,
         )
         _log(
@@ -431,7 +423,7 @@ def build_local_plan(
     }
 
     plan_raw = adk_agents.plan_global(model=models.planner, planning_snapshot=planning_snapshot, timeout_seconds=adk_timeout_seconds)
-    plan = _normalize_plan(plan=plan_raw, inventory_rel_paths=inventory_rel_set)
+    plan = _normalize_plan(plan=plan_raw, inventory_rel_paths=inventory_rel_set, existing_folders=existing_folders_set)
 
     critique: Optional[dict[str, Any]] = None
     acceptable = False
@@ -458,7 +450,7 @@ def build_local_plan(
             critique=critique,
             timeout_seconds=adk_timeout_seconds,
         )
-        plan = _normalize_plan(plan=plan_repaired, inventory_rel_paths=inventory_rel_set)
+        plan = _normalize_plan(plan=plan_repaired, inventory_rel_paths=inventory_rel_set, existing_folders=existing_folders_set)
         _log(logging, f"[repair] iter={iter_idx} updated plan")
 
     # Always save latest plan + critique for inspection.
@@ -574,7 +566,7 @@ def build_local_plan(
             Action(
                 kind="skip_file",
                 file_name=Path(str(s.get("file_path") or "")).name or None,
-                file_path=_safe_join_under_target(target, str(s.get("file_path") or "")) if s.get("file_path") else None,
+                file_path=safe_join_under_target(target, str(s.get("file_path") or "")) if s.get("file_path") else None,
                 details={"reason": s.get("reason")},
             )
         )
@@ -584,13 +576,47 @@ def build_local_plan(
         report["human_summary"] = _human_summary(moves=moves, created_folders=create_unique, skipped=skipped)
 
     if logging:
+        # Per-file placements first (as per spec Section 7.2)
+        file_decisions_list = plan.get("file_decisions") or []
+        _log(logging, "[plan] File placements:")
+        for d in sorted(file_decisions_list, key=lambda x: str(x.get("file_path", "")).lower()):
+            fp = d.get("file_path", "")
+            dest = d.get("destination_folder_path", "(root)")
+            new_folder = d.get("destination_folder_will_be_created", False)
+            move = d.get("move_required", False)
+            rationale = d.get("rationale", "")
+            dest_display = f"{dest}/" if dest != "(root)" else "(root)"
+            _log(logging, f"  - {fp} -> {dest_display} (new_folder={str(new_folder).lower()}, move={str(move).lower()}) rationale=\"{rationale}\"")
+
+        # Folder creates
+        _log(logging, "[plan] Create folders:")
+        if create_unique:
+            for f in create_unique:
+                idx_desc = folder_desc.get(f, "")
+                _log(logging, f"  - {f}/ (index_desc=\"{idx_desc}\")")
+        else:
+            _log(logging, "  - (none)")
+
+        # Summary with stats
+        total_files = len(inventory_rel_set)
+        profiled = len(files_for_planning)
+        skipped_count = len(skipped)
+        new_folders_count = len(create_unique)
+        moves_count = sum(1 for d in file_decisions_list if d.get("move_required", False))
+        leave_in_root_count = sum(1 for d in file_decisions_list if d.get("destination_folder_path") == "(root)" and not d.get("move_required", False))
+        index_updates_count = len([a for a in actions if a.kind == "update_index"])
+        
+        _log(logging, f"[plan] Summary: files={total_files} profiled={profiled} skipped={skipped_count} new_folders={new_folders_count} moves={moves_count} leave_in_root={leave_in_root_count} index_updates={index_updates_count}")
+        _log(logging, "[plan] File decisions saved to store")
+
+        # Exec output (create folders, moves, skipped - for apply preview)
         _log(logging, "[exec] Create folders:")
         for f in create_unique:
-            _log(logging, f"  - {f}")
+            _log(logging, f"  - {f}/")
         _log(logging, "[exec] Moves:")
         for a in actions:
             if a.kind == "move_file":
-                _log(logging, f"  - {Path((a.details or {}).get('from') or '').name} -> {a.folder_name}/")
+                _log(logging, f"  - {(a.details or {}).get('from', '')} -> {a.folder_name}/")
         if skipped:
             _log(logging, "[exec] Skipped:")
             for s in skipped:
@@ -600,6 +626,7 @@ def build_local_plan(
 
 
 def apply_local_plan(*, target: Path, report: dict[str, Any], logging: bool) -> None:
+    """Apply the local plan to the filesystem."""
     if not bool(report.get("accepted")):
         raise RuntimeError("Global plan is unaccepted; refusing to apply.")
 
@@ -611,7 +638,7 @@ def apply_local_plan(*, target: Path, report: dict[str, Any], logging: bool) -> 
             folder = _sanitize_folder_path(a.get("folder_name") or "")
             if folder == "(root)":
                 continue
-            p = _safe_join_under_target(target, folder)
+            p = safe_join_under_target(target, folder)
             if not p.exists():
                 _log(logging, f"[apply] Create folder: {folder}/")
                 p.mkdir(parents=True, exist_ok=True)
@@ -620,8 +647,8 @@ def apply_local_plan(*, target: Path, report: dict[str, Any], logging: bool) -> 
             from_rel = str((a.get("details") or {}).get("from") or "").replace("\\", "/").lstrip("/")
             if not from_rel:
                 continue
-            src = _safe_join_under_target(target, from_rel)
-            dest_dir = target if dest_folder == "(root)" else _safe_join_under_target(target, dest_folder)
+            src = safe_join_under_target(target, from_rel)
+            dest_dir = target if dest_folder == "(root)" else safe_join_under_target(target, dest_folder)
             dest = dest_dir / src.name
             if not src.exists() or not src.is_file():
                 continue
@@ -631,14 +658,14 @@ def apply_local_plan(*, target: Path, report: dict[str, Any], logging: bool) -> 
             _log(logging, f"[apply] Move: {from_rel} -> {dest_folder}/")
             dest_dir.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dest))
-            new_rel = _rel_posix(target, dest)
+            new_rel = rel_posix(target, dest)
             move_profile_entry(profiles=profiles, old_rel_path=from_rel, new_rel_path=new_rel, new_abs_path=dest)
             mark_applied_destination(profiles=profiles, rel_path=new_rel, destination_folder=dest_folder)
         elif kind == "update_index":
             folder = _sanitize_folder_path(a.get("folder_name") or "")
             if folder == "(root)":
                 continue
-            idx = _safe_join_under_target(target, folder) / "_index.md"
+            idx = safe_join_under_target(target, folder) / "_index.md"
             managed_md = str(a.get("index_markdown") or "")
             existing = idx.read_text(encoding="utf-8", errors="ignore") if idx.exists() else ""
             updated = managed_index_update(existing, managed_md)

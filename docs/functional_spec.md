@@ -126,6 +126,16 @@ For each direct subfolder:
 ```text
 [store] Loaded profiles: 83
 [store] Needs summarise: 17
+[store] Cached file profiles:
+  - file1.pdf:
+      summary: "Invoice for services rendered..."
+      subject: "Invoice"
+      keywords: [invoice, payment, services]
+  - file2.docx:
+      summary: "Risk assessment for outdoor activity..."
+      subject: "Risk Assessment"
+      keywords: [risk, assessment, safety, outdoor]
+  - image.png: [SKIPPED] reason="insufficient extracted text"
 ```
 
 #### 4.2 Extract content (bounded, no fallback)
@@ -214,28 +224,45 @@ Run an LLM planning agent to produce a global plan that considers:
 - existing folders first,
 - creating **role folders** when role clusters are strong,
 - creating **project/topic folders** when a mini-collection exists,
-- avoiding creating one-off folders and surprising splits.
+- avoiding creating one-off folders and surprising splits,
+- producing **a placement decision for every file with a profile**, even if it is "leave in root".
 
 #### 7.1 Global plan output schema
 
-- `actions[]` (ordered):
-  - `create_folder {path, index_desc}`
-  - `move_file {from, to, rationale}`
-  - `update_index {folder_path}`
-- `file_decisions[]`:
-  - `file_path`
-  - `destination_folder_path` (use `(root)` for no move)
-  - `rationale`
+The plan must output both:
+1) **Actions** (what to do), and
+2) **Per-file decisions** (where every file goes and why).
+
+**actions[]** (ordered):
+- `create_folder {path, index_desc}`
+- `move_file {from, to_folder, rationale}`
+- `update_index {folder_path}`
+
+**file_decisions[]** (one entry per file with a profile):
+- `file_path`
+- `current_folder_path` (use `(root)` when currently in target root)
+- `destination_folder_path` (use `(root)` for no move)
+- `destination_folder_exists` (true/false)
+- `destination_folder_will_be_created` (true/false) — derived from actions
+- `move_required` (true/false)
+- `rationale` (one line)
 
 Save the plan (including rationales) to the local store.
 
-**Logging**:
+**Logging** (per-file placements first, then folder creates, then summary):
 
 ```text
-[plan] Proposed actions:
-  - create_folder: Camp Gadgets
-  - move_file: RA - Camp Gadgets.docx -> Camp Gadgets/ (reason="paired plan + RA mini-collection")
-  - move_file: RA - Pizza ovens.docx -> Risk Assessments/ (reason="risk assessment role; no paired project folder")
+[plan] File placements:
+  - RA - Camp Gadgets.docx -> Camp Gadgets/ (new_folder=true, move=true) rationale="Paired plan + RA mini-collection"
+  - Camp Gadgets.docx -> Camp Gadgets/ (new_folder=true, move=true) rationale="Paired plan + RA mini-collection"
+  - RA - Pizza ovens.docx -> Risk Assessments/ (new_folder=true, move=true) rationale="Risk assessment role; no matching project folder"
+  - 2018-04-28_morning-run.md -> (root) (new_folder=false, move=false) rationale="No recurring cluster; avoid one-off folder"
+[plan] Create folders:
+  - Camp Gadgets/ (index_desc="Camp Gadgets activity files and related risk assessments")
+  - Photographer badge/ (index_desc="Photographer badge materials and supporting docs")
+  - Risk Assessments/ (index_desc="Safety/risk docs for activities")
+  - Activity Plans/ (index_desc="Plans and instructions for activities")
+[plan] Summary: files=10 profiled=10 skipped=1 new_folders=4 moves=9 leave_in_root=1 index_updates=4
 [plan] File decisions saved to store
 ```
 

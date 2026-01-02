@@ -68,6 +68,16 @@ All Google ADK agents use a fast, low-cost model:
 ```text
 [store] Loaded profiles: 83
 [store] Needs summarise: 17
+[store] Cached file profiles:
+  - file1.pdf:
+      summary: "Invoice for services rendered..."
+      subject: "Invoice"
+      keywords: [invoice, payment, services]
+  - file2.docx:
+      summary: "Risk assessment for outdoor activity..."
+      subject: "Risk Assessment"
+      keywords: [risk, assessment, safety, outdoor]
+  - image.png: [SKIPPED] reason="insufficient extracted text"
 ```
 
 ### 4.2 Extract content (bounded, no fallback)
@@ -144,34 +154,63 @@ Example: “RA - Camp Gadgets” goes to `Camp Gadgets/` (with its paired plan) 
 ```
 
 ## 7) Generate a global plan with Google ADK (Planning Agent)
-- Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to propose a global plan that:
-  - reuses existing folders first,
-  - creates **role folders** when role clusters are strong,
-  - creates **project/topic folders** when a mini-collection exists,
-  - avoids creating one-off folders.
+- Run ADK `LlmAgent` (model `gemini-2.0-flash-lite`) to propose a **global plan** that uses:
+  - existing folders + `_index.md` descriptions,
+  - stored `file_profile` entries,
+  - detected **role clusters** and **project/topic clusters**.
 
-### 7.1 Plan output schema (global)
-The plan outputs actions and per-file destinations.
-- `actions[]` (ordered):
-  - `create_folder {path, index_desc}`
-  - `move_file {from, to, rationale}`
-  - `update_index {folder_path}`
-- `file_decisions[]`:
-  - `file_path`
-  - `destination_folder_path` (use `(root)` for no move)
-  - `rationale`
+The planner must:
+- reuse existing folders first,
+- create **role folders** when role clusters are strong,
+- create **project/topic folders** when a mini-collection exists,
+- avoid creating one-off folders (especially 1-file folders),
+- produce **a placement decision for every file with a profile**, even if it is “leave in root”.
+
+### 7.1 Global plan output schema (explicit)
+The plan must output both:
+1) **Actions** (what to do), and
+2) **Per-file decisions** (where every file goes and why).
+
+**actions[]** (ordered):
+- `create_folder {path, index_desc}`
+- `move_file {from, to, rationale}`
+- `update_index {folder_path}`
+
+**file_decisions[]** (one entry per file with a profile):
+- `file_path`
+- `current_folder_path` (use `(root)` when currently in target root)
+- `destination_folder_path` (use `(root)` for no move)
+- `destination_folder_exists` (true/false)
+- `destination_folder_will_be_created` (true/false)  // derived from actions
+- `move_required` (true/false)
+- `rationale` (one line)
 
 Save the plan (including per-file rationale) into the local store.
 
-**Logging (`--logging`)**
+### 7.2 Logging (`--logging`)
+Print **per-file placements first**, then a short summary.
+
+**Per-file placements**
 ```text
-[plan] Proposed actions:
-  - create_folder: Camp Gadgets
-  - create_folder: Photographer badge
-  - create_folder: Risk Assessments
-  - create_folder: Activity Plans
-  - move_file: RA - Camp Gadgets.docx -> Camp Gadgets/ (reason="paired plan + RA mini-collection")
-  - move_file: RA - Pizza ovens.docx -> Risk Assessments/ (reason="risk assessment role; no paired project folder")
+[plan] File placements:
+  - RA - Camp Gadgets.docx -> Camp Gadgets/ (new_folder=true, move=true) rationale="Paired plan + RA mini-collection"
+  - Camp Gadgets.docx -> Camp Gadgets/ (new_folder=true, move=true) rationale="Paired plan + RA mini-collection"
+  - RA - Pizza ovens.docx -> Risk Assessments/ (new_folder=true, move=true) rationale="Risk assessment role; no matching project folder"
+  - 2018-04-28_morning-run.md -> (root) (new_folder=false, move=false) rationale="No recurring cluster; avoid one-off folder"
+```
+
+**Folder creates**
+```
+[plan] Create folders:
+  - Camp Gadgets/ (index_desc="Camp Gadgets activity files and related risk assessments")
+  - Photographer badge/ (index_desc="Photographer badge materials and supporting docs")
+  - Risk Assessments/ (index_desc="Safety/risk docs for activities")
+  - Activity Plans/ (index_desc="Plans and instructions for activities")
+```
+
+**Summary**
+```
+[plan] Summary: files=10 profiled=10 skipped=1 new_folders=4 moves=9 leave_in_root=1 index_updates=4
 [plan] File decisions saved to store
 ```
 

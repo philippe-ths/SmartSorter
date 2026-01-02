@@ -5,10 +5,15 @@
 - `ai_folder_sorter/`: main Python package.
   - `cli.py`, `__main__.py`: CLI entrypoint (`python -m ai_folder_sorter`).
   - `planner.py`: builds the sort plan (summaries → decisions → critic loop → actions).
-  - `adk_agents.py`: Google ADK agent wrappers and prompt/instruction text.
+  - `adk_agents.py`: Google ADK agent wrappers with retry logic.
+  - `prompts.py`: centralized LLM prompt templates (summarize, plan, critique, repair).
+  - `extractor.py`: unified file content extraction (PDF, DOCX, XLSX, images, Google stubs).
+  - `paths.py`: path normalization, validation, and safety checks (`FolderPath` value object).
+  - `models.py`: dataclasses and TypedDict definitions used across the project.
+  - `clustering.py`: keyword-based cluster detection for role/project folders.
+  - `store.py`: local profile store management (`.aifo/profiles.json`).
   - `drive.py`: Google Drive helpers (list/export/move/upsert `_index.md`).
-  - `models.py`: dataclasses used across the project.
-  - `utils.py`: small utilities (name normalization, stub ID extraction).
+  - `utils.py`: small utilities (name normalization, managed index updates).
 - `agent.py`: ADK-friendly entrypoint for running via ADK tooling.
 - `docs/`: project documentation.
 - `requirements.txt`: runtime dependencies.
@@ -20,7 +25,7 @@ Treat `docs/` as source-of-truth for behavior. **Read the relevant doc(s) before
 - Before changing the end-to-end workflow, CLI UX, logging, or step ordering, read `docs/functional_spec.md`.
 - Before changing scope/safety/MVP behavior, read `docs/plan.md`.
 - Before changing folder naming, “bounded specificity”, or when to create new folders, read `docs/folder_taxonomy_guide.md`.
-- Before changing ADK prompts/agents/session-state patterns (especially `ai_folder_sorter/adk_agents.py`), read `docs/adk_general_guide.md`.
+- Before changing ADK prompts/agents/session-state patterns, read `docs/adk_general_guide.md`. Prompts are in `ai_folder_sorter/prompts.py`; agent wrappers are in `ai_folder_sorter/adk_agents.py`.
 - Before changing Drive OAuth, `.gdoc/.gsheet/.gslides` dereferencing, or export/preview behavior, read `docs/google_drive_guide.md`.
 - Ignore `docs/.DS_Store` (not documentation).
 
@@ -41,7 +46,8 @@ Treat `docs/` as source-of-truth for behavior. **Read the relevant doc(s) before
 
 ## Testing Guidelines
 
-- No dedicated test suite yet; run `python -m compileall ai_folder_sorter` and one `--show-summaries` dry-run.
+- No dedicated test suite yet; run `python -m compileall ai_folder_sorter` and one `--show-summaries --logging` dry-run.
+- With `--logging`, cached profiles are displayed showing summary, subject, and keywords for each file.
 
 ## Commit & Pull Request Guidelines
 
