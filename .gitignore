@@ -43,3 +43,10 @@ build/
 .next/
 .nuxt/
 
+# AI workflow and skills (tooling config, not product code)
+.github/copilot-instructions.md
+.github/skills/
+.ai-policy/
+.githooks/
+ai-workflow.md
+project-spec.md
