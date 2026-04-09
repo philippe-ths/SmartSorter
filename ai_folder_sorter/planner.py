@@ -1,776 +1,675 @@
 from __future__ import annotations
 
-import mimetypes
+import json
 import shutil
-from datetime import datetime
-from html.parser import HTMLParser
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from . import __version__
-from .adk_agents import critique_plan_with_adk, decide_folder_with_adk, summarize_with_adk
-from .drive import (
-    download_text_like_file,
-    ensure_folder,
-    export_google_native_text,
-    find_child_by_name,
-    list_top_level_children,
-    read_small_text_file,
-    move_file,
-    upsert_index_md,
+from . import adk_agents
+from .clustering import FileForClustering, detect_keyword_clusters
+from .extractor import ExtractedContent, extract_text
+from .models import Action, FolderProfile
+from .paths import FolderPath, normalize_folder_path, rel_posix, safe_join_under_target
+from .store import STORE_DIR_NAME, load_profiles, mark_applied_destination, move_profile_entry, save_latest_plan, save_profiles, upsert_profile, is_unchanged
+from .utils import (
+    is_ignorable_file_name,
+    managed_index_update,
+    sanitize_folder_name,
+    sniff_mime_type,
 )
-from .models import FolderInfo, PlanAction, SortPlan
-from .utils import extract_google_id_from_stub, is_bad_folder_name, normalize_folder_name, pick_fallback_folder
 
 
-def _folder_descriptions(folder_id: str, *, supports_all_drives: bool) -> list[FolderInfo]:
-    items = list_top_level_children(folder_id, supports_all_drives=supports_all_drives)
-    folders = [i for i in items if i.is_folder]
-    out: list[FolderInfo] = []
-    for f in folders:
-        idx = find_child_by_name(f.id, name="_index.md", supports_all_drives=supports_all_drives)
-        desc = ""
-        if idx:
-            desc = read_small_text_file(idx.id, max_chars=20_000, supports_all_drives=supports_all_drives) or ""
-        out.append(FolderInfo(id=f.id, name=f.name, description=desc))
-    return out
+def _log(enabled: bool, msg: str) -> None:
+    """Log a message if logging is enabled."""
+    if enabled:
+        print(msg, flush=True)
 
 
-def _extract_text_preview(file_id: str, *, mime_type: str, max_chars: int, supports_all_drives: bool) -> str:
-    if mime_type.startswith("application/vnd.google-apps."):
-        if mime_type == "application/vnd.google-apps.form":
-            return ""
-        exported = export_google_native_text(
-            file_id, mime_type=mime_type, max_chars=max_chars, supports_all_drives=supports_all_drives
-        )
-        return exported or ""
-
-    downloaded = download_text_like_file(
-        file_id, mime_type=mime_type, max_chars=max_chars, supports_all_drives=supports_all_drives
-    )
-    return downloaded or ""
+def _folder_path_for_rel(rel_path: str) -> str:
+    """Extract the folder portion from a relative file path."""
+    return FolderPath.from_rel_file_path(rel_path).value
 
 
-def _local_folder_descriptions(local_path: Path) -> list[FolderInfo]:
-    out: list[FolderInfo] = []
-    for p in sorted(local_path.iterdir(), key=lambda x: x.name.lower()):
-        if not p.is_dir():
+def _sanitize_folder_path(path: str) -> str:
+    """Sanitize and normalize a folder path."""
+    return normalize_folder_path(path)
+
+
+def _extract_file_text(path: Path, *, max_chars: int) -> ExtractedContent:
+    """Extract text content from a file using the appropriate extractor."""
+    return extract_text(path, max_chars=max_chars)
+
+
+def _list_bounded_inventory(
+    target: Path,
+) -> tuple[list[Path], list[Path]]:
+    """
+    Returns (files, folders), both absolute Paths.
+
+    Top-level only:
+    - Includes files in target root.
+    - Includes direct subfolders (as candidates for placement).
+    - Does NOT traverse into subfolders.
+    """
+    files: list[Path] = []
+    folders: list[Path] = []
+
+    for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+        if child.name == STORE_DIR_NAME:
             continue
-        desc = ""
-        idx = p / "_index.md"
+        if child.is_file():
+            if not is_ignorable_file_name(child.name):
+                files.append(child)
+            continue
+        if not child.is_dir():
+            continue
+        if is_ignorable_file_name(child.name):
+            continue
+        folders.append(child)
+
+    return files, folders
+
+
+def _folder_profiles(target: Path, folders: list[Path], *, max_index_chars: int = 800) -> list[FolderProfile]:
+    """Build folder profile objects from existing folders."""
+    profiles: list[FolderProfile] = []
+    for folder in sorted(folders, key=lambda p: rel_posix(target, p).lower()):
+        idx = folder / "_index.md"
         if idx.exists() and idx.is_file():
-            desc = idx.read_text(encoding="utf-8", errors="ignore")[:20_000]
-        out.append(FolderInfo(id=str(p), name=p.name, description=desc))
-    return out
-
-
-def _local_read_text(path: Path, *, max_chars: int) -> str:
-    if not path.exists() or not path.is_file():
-        return ""
-    try:
-        with path.open("rb") as f:
-            data = f.read(max_chars if max_chars and max_chars > 0 else 60_000)
-        return data.decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-
-class _HTMLTextExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self._parts: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        if data and data.strip():
-            self._parts.append(data.strip())
-
-    def text(self) -> str:
-        return "\n".join(self._parts)
-
-
-def _local_read_html_text(path: Path, *, max_chars: int) -> str:
-    raw = _local_read_text(path, max_chars=max_chars)
-    if not raw:
-        return ""
-    parser = _HTMLTextExtractor()
-    try:
-        parser.feed(raw)
-    except Exception:
-        return ""
-    return parser.text()
-
-
-def _local_read_pdf_text(path: Path, *, max_chars: int) -> str:
-    try:
-        from pypdf import PdfReader  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError("Missing dependency: pypdf (required to extract PDF text).") from e
-
-    try:
-        reader = PdfReader(str(path))
-        parts: list[str] = []
-        for page in reader.pages:
-            txt = page.extract_text() or ""
-            if txt.strip():
-                parts.append(txt)
-            joined = "\n".join(parts)
-            if max_chars and max_chars > 0 and len(joined) >= max_chars:
-                return joined[:max_chars]
-        return "\n".join(parts)[:max_chars] if max_chars and max_chars > 0 else "\n".join(parts)
-    except Exception:
-        return ""
-
-
-def _local_preview_for_item(path: Path, *, max_chars: int, supports_all_drives: bool) -> tuple[str, str]:
-    ext = path.suffix.lower()
-    if ext in {".gdoc", ".gsheet", ".gslides", ".gform"}:
-        file_id = extract_google_id_from_stub(path)
-        if not file_id:
-            return "", "application/vnd.google-apps.shortcut"
-        if ext == ".gdoc":
-            mime = "application/vnd.google-apps.document"
-        elif ext == ".gsheet":
-            mime = "application/vnd.google-apps.spreadsheet"
-        elif ext == ".gslides":
-            mime = "application/vnd.google-apps.presentation"
+            raw = idx.read_text(encoding="utf-8", errors="ignore")
+            desc = raw.strip().splitlines()[0:5]
+            desc_text = " ".join([x.strip() for x in desc if x.strip()])[:max_index_chars] or None
+            profiles.append(
+                FolderProfile(folder_path=rel_posix(target, folder), name=folder.name, desc=desc_text, has_index=True)
+            )
         else:
-            mime = "application/vnd.google-apps.form"
-
-        if mime == "application/vnd.google-apps.form":
-            return "", mime
-
-        text = export_google_native_text(
-            file_id, mime_type=mime, max_chars=max_chars, supports_all_drives=supports_all_drives
-        )
-        return text or "", mime
-
-    if ext in {".md", ".markdown"}:
-        return _local_read_text(path, max_chars=max_chars), "text/markdown"
-
-    guessed, _ = mimetypes.guess_type(path.name)
-    mime = guessed or "application/octet-stream"
-    if ext == ".pdf":
-        return _local_read_pdf_text(path, max_chars=max_chars), "application/pdf"
-    if ext in {".html", ".htm"}:
-        return _local_read_html_text(path, max_chars=max_chars), mime
-    if mime.startswith("text/") or mime in {"application/json", "application/xml"}:
-        return _local_read_text(path, max_chars=max_chars), mime
-    return "", mime
+            profiles.append(FolderProfile(folder_path=rel_posix(target, folder), name=folder.name, desc=None, has_index=False))
+    return profiles
 
 
-def build_plan(
-    *,
-    folder_id: str | None,
-    local_path: str | None,
-    max_chars: int,
-    supports_all_drives: bool,
-    model_summary: str,
-    model_folder: str,
-    model_critic: str,
-    critic_iterations: int,
-    adk_timeout_seconds: int,
-    emit_report: bool,
-) -> SortPlan:
-    # This project requires ADK + an LLM-backed summarizer/critic.
-    # (Per requirements: no heuristic fallback mode.)
-    if folder_id:
-        return _build_drive_plan(
-            folder_id=folder_id,
-            max_chars=max_chars,
-            supports_all_drives=supports_all_drives,
-            model_summary=model_summary,
-            model_folder=model_folder,
-            model_critic=model_critic,
-            critic_iterations=critic_iterations,
-            adk_timeout_seconds=adk_timeout_seconds,
-            emit_report=emit_report,
-        )
-
-    if not local_path:
-        raise ValueError("Either folder_id or local_path is required.")
-    return _build_local_plan(
-        local_path=local_path,
-        max_chars=max_chars,
-        supports_all_drives=supports_all_drives,
-        model_summary=model_summary,
-        model_folder=model_folder,
-        model_critic=model_critic,
-        critic_iterations=critic_iterations,
-        adk_timeout_seconds=adk_timeout_seconds,
-        emit_report=emit_report,
-    )
+def _render_managed_index(*, folder_path: str, desc: Optional[str], files: list[dict[str, str]]) -> str:
+    folder_name = folder_path.split("/")[-1] if "/" in folder_path else folder_path
+    header = f"# {folder_name}\n"
+    desc_line = (desc or "").strip()
+    if desc_line:
+        body = f"\n{desc_line}\n\n## Managed Index\n"
+    else:
+        body = "\n## Managed Index\n"
+    lines = [header + body, "This section is managed by SmartSorter.\n", "### Recently filed\n"]
+    for f in files:
+        fn = f.get("file_name", "")
+        summ = (f.get("summary") or "").strip()
+        if summ:
+            lines.append(f"- {fn}: {summ}\n")
+        else:
+            lines.append(f"- {fn}\n")
+    return "".join(lines).strip() + "\n"
 
 
-def _build_drive_plan(
-    *,
-    folder_id: str,
-    max_chars: int,
-    supports_all_drives: bool,
-    model_summary: str,
-    model_folder: str,
-    model_critic: str,
-    critic_iterations: int,
-    adk_timeout_seconds: int,
-    emit_report: bool,
-) -> SortPlan:
-    items = list_top_level_children(folder_id, supports_all_drives=supports_all_drives)
-    folders = _folder_descriptions(folder_id, supports_all_drives=supports_all_drives)
-    folder_names = sorted({f.name for f in folders})
-    fallback = pick_fallback_folder(folder_names)
+def _human_summary(*, moves: list[dict[str, str]], created_folders: list[str], skipped: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    lines.append("Create folders:\n")
+    if created_folders:
+        for f in created_folders:
+            lines.append(f"- {f}/\n")
+    else:
+        lines.append("- (none)\n")
 
-    existing_folders_payload = [
-        {"name": f.name, "description": (f.description or "").strip()} for f in sorted(folders, key=lambda x: x.name)
-    ]
+    lines.append("\nMoves:\n")
+    if moves:
+        for m in moves:
+            lines.append(f'- {m["from"]} -> {m["to_folder"]}/\n' if m["to_folder"] != "(root)" else f'- {m["from"]} -> (root)\n')
+    else:
+        lines.append("- (none)\n")
 
-    file_entries: list[dict[str, Any]] = []
-    report: list[dict[str, Any]] = []
-    report_by_key: dict[str, dict[str, Any]] = {}
+    if skipped:
+        lines.append("\nSkipped:\n")
+        for s in skipped:
+            reason = s.get("reason") or ""
+            if reason:
+                lines.append(f'- {s.get("file_path")} (reason="{reason}")\n')
+            else:
+                lines.append(f'- {s.get("file_path")}\n')
+    return "".join(lines).strip()
 
-    for item in items:
-        if item.is_folder:
+
+def _normalize_plan(*, plan: dict[str, Any], inventory_rel_paths: set[str], existing_folders: set[str]) -> dict[str, Any]:
+    actions = plan.get("actions") or []
+    file_decisions = plan.get("file_decisions") or []
+
+    if not isinstance(actions, list):
+        actions = []
+    if not isinstance(file_decisions, list):
+        file_decisions = []
+
+    norm_actions: list[dict[str, Any]] = []
+    created_folders: set[str] = set()
+    
+    for a in actions:
+        if not isinstance(a, dict):
             continue
-
-        text_snippet = _extract_text_preview(
-            item.id, mime_type=item.mime_type, max_chars=max_chars, supports_all_drives=supports_all_drives
-        )
-        file_profile: dict[str, Any] = {
-            "filename": item.name,
-            "mimeType": item.mime_type,
-            "textSnippet": text_snippet,
-            "metadata": {"modifiedTime": item.modified_time},
-        }
-
-        if not text_snippet.strip():
-            raise RuntimeError(f"No extractable text for Drive file: {item.name} ({item.mime_type}).")
-        summary_obj = summarize_with_adk(
-            model=model_summary,
-            filename=item.name,
-            mime_type=item.mime_type,
-            text_snippet=text_snippet,
-            metadata={"modifiedTime": item.modified_time},
-            timeout_seconds=adk_timeout_seconds,
-        )
-        if not summary_obj:
-            raise RuntimeError(f"Failed to summarize Drive file: {item.name}")
-        file_profile["summary"] = summary_obj.summary
-        file_profile["keywords"] = summary_obj.keywords
-        file_profile["subject_label"] = summary_obj.subject_label
-
-        decision_obj = decide_folder_with_adk(
-            model=model_folder,
-            file_profile=file_profile,
-            existing_folders=existing_folders_payload,
-            timeout_seconds=adk_timeout_seconds,
-        )
-        if not decision_obj:
-            raise RuntimeError(f"Failed to decide folder for Drive file: {item.name}")
-        candidate = normalize_folder_name(decision_obj.target_folder.name)
-        if is_bad_folder_name(candidate):
-            raise RuntimeError(f"LLM proposed an invalid folder name: {candidate!r} for file {item.name!r}")
-        target_folder_name = candidate
-        index_desc_if_new = decision_obj.index_description_if_new or ""
-        rationale = decision_obj.rationale or ""
-        if emit_report:
-            rep: dict[str, Any] = {
-                "file_key": item.id,
-                "filename": item.name,
-                "mimeType": item.mime_type,
-                "textChars": len(text_snippet),
-                "summary": {
-                    "summary": summary_obj.summary,
-                    "keywords": summary_obj.keywords,
-                    "subject_label": summary_obj.subject_label,
-                },
-                "decision_initial": {
-                    "target_folder": {"name": target_folder_name, "exists": decision_obj.target_folder.exists},
-                    "index_description_if_new": decision_obj.index_description_if_new,
-                    "rationale": decision_obj.rationale,
-                },
-            }
-            report.append(rep)
-            report_by_key[item.id] = rep
-
-        file_entries.append(
-            {
-                "file_key": item.id,
-                "filename": item.name,
-                "mimeType": item.mime_type,
-                "textChars": len(text_snippet),
-                "summary": {
-                    "summary": summary_obj.summary,
-                    "keywords": summary_obj.keywords,
-                    "subject_label": summary_obj.subject_label,
-                },
-                "proposed": {
-                    "target_folder": {"name": target_folder_name, "exists": target_folder_name in folder_names},
-                    "index_description_if_new": index_desc_if_new,
-                    "rationale": rationale,
-                },
-            }
-        )
-
-    if critic_iterations > 0:
-        file_entries, critic_notes = _apply_critic_loop(
-            file_entries=file_entries,
-            existing_folders=existing_folders_payload,
-            folder_names=folder_names,
-            model_critic=model_critic,
-            critic_iterations=critic_iterations,
-            timeout_seconds=adk_timeout_seconds,
-        )
-        if emit_report:
-            for e in file_entries:
-                rep = report_by_key.get(e["file_key"])
-                if not rep:
-                    continue
-                initial = rep.get("decision_initial", {})
-                initial_tf = initial.get("target_folder", {}) if isinstance(initial, dict) else {}
-                initial_name = (initial_tf.get("name") or "").strip()
-                initial_index_desc = (initial.get("index_description_if_new") or "").strip() if isinstance(initial, dict) else ""
-                initial_rationale = (initial.get("rationale") or "").strip() if isinstance(initial, dict) else ""
-                final_tf = e["proposed"]["target_folder"]
-                final_name = final_tf.get("name") or ""
-                final_index_desc = (e["proposed"].get("index_description_if_new") or "").strip()
-                final_rationale = (e["proposed"].get("rationale") or "").strip()
-                rep["decision_final"] = {
-                    "target_folder": {"name": final_name, "exists": bool(final_tf.get("exists"))},
-                    "index_description_if_new": final_index_desc,
-                    "rationale": final_rationale,
-                }
-                changes: dict[str, Any] = {}
-                if final_name != initial_name:
-                    changes["target_folder"] = {"from": initial_name, "to": final_name}
-                if final_index_desc != initial_index_desc:
-                    changes["index_description_if_new"] = {"from": initial_index_desc, "to": final_index_desc}
-                if final_rationale != initial_rationale:
-                    changes["rationale"] = {"from": initial_rationale, "to": final_rationale}
-                rep["critic_changed"] = bool(changes)
-                if changes:
-                    rep["critic_change"] = changes
-        if emit_report:
-            report.append({"critic": critic_notes})
-    elif emit_report:
-        for e in file_entries:
-            rep = report_by_key.get(e["file_key"])
-            if not rep:
+        kind = str(a.get("kind") or "").strip()
+        if kind == "create_folder":
+            p = _sanitize_folder_path(str(a.get("path") or ""))
+            if p == "(root)":
                 continue
-            tf = e["proposed"]["target_folder"]
-            rep["decision_final"] = {
-                "target_folder": {"name": tf.get("name") or "", "exists": bool(tf.get("exists"))},
-                "index_description_if_new": e["proposed"].get("index_description_if_new", ""),
-                "rationale": e["proposed"].get("rationale", ""),
-            }
-            rep["critic_changed"] = False
-
-    actions, touched_folder_names, intended_index_desc = _actions_from_entries(
-        mode="drive",
-        base_folder_id=folder_id,
-        folder_names=folder_names,
-        entries=file_entries,
-    )
-
-    for name in sorted(touched_folder_names):
-        desc = intended_index_desc.get(name) or f"Files related to {name}."
-        md = _render_index_md(folder_name=name, description=desc)
-        actions.append(PlanAction(kind="write_index", folder_name=name, index_markdown=md))
-
-    return SortPlan(
-        mode="drive", folder_id=folder_id, local_path=None, actions=actions, folder_name_to_id={}, report=report
-    )
-
-
-def _build_local_plan(
-    *,
-    local_path: str,
-    max_chars: int,
-    supports_all_drives: bool,
-    model_summary: str,
-    model_folder: str,
-    model_critic: str,
-    critic_iterations: int,
-    adk_timeout_seconds: int,
-    emit_report: bool,
-) -> SortPlan:
-    base = Path(local_path).expanduser().resolve()
-    if not base.exists() or not base.is_dir():
-        raise ValueError(f"Not a folder: {base}")
-
-    folders = _local_folder_descriptions(base)
-    folder_names = sorted({f.name for f in folders})
-    fallback = pick_fallback_folder(folder_names)
-    existing_folders_payload = [
-        {"name": f.name, "description": (f.description or "").strip()} for f in sorted(folders, key=lambda x: x.name)
-    ]
-
-    file_entries: list[dict[str, Any]] = []
-    report: list[dict[str, Any]] = []
-    report_by_key: dict[str, dict[str, Any]] = {}
-
-    for p in sorted(base.iterdir(), key=lambda x: x.name.lower()):
-        if p.is_dir():
-            continue
-        if p.name == "_index.md":
-            continue
-
-        text_snippet, mime_type = _local_preview_for_item(
-            p, max_chars=max_chars, supports_all_drives=supports_all_drives
-        )
-        file_profile: dict[str, Any] = {
-            "filename": p.name,
-            "mimeType": mime_type,
-            "textSnippet": text_snippet,
-            "metadata": {"local_path": str(p)},
-        }
-
-        if not text_snippet.strip():
-            raise RuntimeError(f"No extractable text for local file: {p.name} ({mime_type}).")
-        try:
-            summary_obj = summarize_with_adk(
-                model=model_summary,
-                filename=p.name,
-                mime_type=mime_type,
-                text_snippet=text_snippet,
-                metadata={"local_path": str(p)},
-                timeout_seconds=adk_timeout_seconds,
-            )
-        except Exception as e:
-            raise RuntimeError(f"ADK summarization failed for local file: {p.name}") from e
-        if not summary_obj:
-            raise RuntimeError(f"Failed to summarize local file: {p.name}")
-        file_profile["summary"] = summary_obj.summary
-        file_profile["keywords"] = summary_obj.keywords
-        file_profile["subject_label"] = summary_obj.subject_label
-
-        try:
-            decision_obj = decide_folder_with_adk(
-                model=model_folder,
-                file_profile=file_profile,
-                existing_folders=existing_folders_payload,
-                timeout_seconds=adk_timeout_seconds,
-            )
-        except Exception as e:
-            raise RuntimeError(f"ADK folder decision failed for local file: {p.name}") from e
-        if not decision_obj:
-            raise RuntimeError(f"Failed to decide folder for local file: {p.name}")
-        candidate = normalize_folder_name(decision_obj.target_folder.name)
-        if is_bad_folder_name(candidate):
-            raise RuntimeError(f"LLM proposed an invalid folder name: {candidate!r} for file {p.name!r}")
-        target_folder_name = candidate
-        index_desc_if_new = decision_obj.index_description_if_new or ""
-        rationale = decision_obj.rationale or ""
-        if emit_report:
-            rep: dict[str, Any] = {
-                "file_key": str(p),
-                "filename": p.name,
-                "mimeType": mime_type,
-                "textChars": len(text_snippet),
-                "summary": {
-                    "summary": summary_obj.summary,
-                    "keywords": summary_obj.keywords,
-                    "subject_label": summary_obj.subject_label,
-                },
-                "decision_initial": {
-                    "target_folder": {"name": target_folder_name, "exists": decision_obj.target_folder.exists},
-                    "index_description_if_new": decision_obj.index_description_if_new,
-                    "rationale": decision_obj.rationale,
-                },
-            }
-            report.append(rep)
-            report_by_key[str(p)] = rep
-        file_entries.append(
-            {
-                "file_key": str(p),
-                "filename": p.name,
-                "file_path": str(p),
-                "mimeType": mime_type,
-                "textChars": len(text_snippet),
-                "summary": {
-                    "summary": summary_obj.summary,
-                    "keywords": summary_obj.keywords,
-                    "subject_label": summary_obj.subject_label,
-                },
-                "proposed": {
-                    "target_folder": {"name": target_folder_name, "exists": target_folder_name in folder_names},
-                    "index_description_if_new": index_desc_if_new,
-                    "rationale": rationale,
-                },
-            }
-        )
-
-    if critic_iterations > 0:
-        file_entries, critic_notes = _apply_critic_loop(
-            file_entries=file_entries,
-            existing_folders=existing_folders_payload,
-            folder_names=folder_names,
-            model_critic=model_critic,
-            critic_iterations=critic_iterations,
-            timeout_seconds=adk_timeout_seconds,
-        )
-        if emit_report:
-            for e in file_entries:
-                rep = report_by_key.get(e["file_key"])
-                if not rep:
-                    continue
-                initial = rep.get("decision_initial", {})
-                initial_tf = initial.get("target_folder", {}) if isinstance(initial, dict) else {}
-                initial_name = (initial_tf.get("name") or "").strip()
-                initial_index_desc = (initial.get("index_description_if_new") or "").strip() if isinstance(initial, dict) else ""
-                initial_rationale = (initial.get("rationale") or "").strip() if isinstance(initial, dict) else ""
-                final_tf = e["proposed"]["target_folder"]
-                final_name = final_tf.get("name") or ""
-                final_index_desc = (e["proposed"].get("index_description_if_new") or "").strip()
-                final_rationale = (e["proposed"].get("rationale") or "").strip()
-                rep["decision_final"] = {
-                    "target_folder": {"name": final_name, "exists": bool(final_tf.get("exists"))},
-                    "index_description_if_new": final_index_desc,
-                    "rationale": final_rationale,
-                }
-                changes: dict[str, Any] = {}
-                if final_name != initial_name:
-                    changes["target_folder"] = {"from": initial_name, "to": final_name}
-                if final_index_desc != initial_index_desc:
-                    changes["index_description_if_new"] = {"from": initial_index_desc, "to": final_index_desc}
-                if final_rationale != initial_rationale:
-                    changes["rationale"] = {"from": initial_rationale, "to": final_rationale}
-                rep["critic_changed"] = bool(changes)
-                if changes:
-                    rep["critic_change"] = changes
-        if emit_report:
-            report.append({"critic": critic_notes})
-    elif emit_report:
-        for e in file_entries:
-            rep = report_by_key.get(e["file_key"])
-            if not rep:
+            created_folders.add(p)
+            norm_actions.append({"kind": "create_folder", "path": p, "index_desc": (str(a.get("index_desc") or "").strip() or None)})
+        elif kind == "move_file":
+            src = str(a.get("from") or "").replace("\\", "/").lstrip("/")
+            if not src or src not in inventory_rel_paths:
                 continue
-            tf = e["proposed"]["target_folder"]
-            rep["decision_final"] = {
-                "target_folder": {"name": tf.get("name") or "", "exists": bool(tf.get("exists"))},
-                "index_description_if_new": e["proposed"].get("index_description_if_new", ""),
-                "rationale": e["proposed"].get("rationale", ""),
-            }
-            rep["critic_changed"] = False
-
-    actions, touched_folder_names, intended_index_desc = _actions_from_entries(
-        mode="local",
-        base_folder_id=None,
-        folder_names=folder_names,
-        entries=file_entries,
-    )
-
-    for name in sorted(touched_folder_names):
-        desc = intended_index_desc.get(name) or f"Files related to {name}."
-        md = _render_index_md(folder_name=name, description=desc)
-        actions.append(PlanAction(kind="write_index", folder_name=name, index_markdown=md))
-
-    return SortPlan(
-        mode="local", folder_id=None, local_path=str(base), actions=actions, folder_name_to_id={}, report=report
-    )
-
-
-def _apply_critic_loop(
-    *,
-    file_entries: list[dict[str, Any]],
-    existing_folders: list[dict[str, str]],
-    folder_names: list[str],
-    model_critic: str,
-    critic_iterations: int,
-    timeout_seconds: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    by_key = {e["file_key"]: e for e in file_entries}
-    notes: dict[str, Any] = {"iterations": []}
-
-    for i in range(max(0, critic_iterations)):
-        draft_plan = {
-            "existing_folders": existing_folders,
-            "proposed_assignments": [
+            to_folder = _sanitize_folder_path(str(a.get("to_folder") or "(root)"))
+            norm_actions.append(
                 {
-                    "file_key": e["file_key"],
-                    "filename": e["filename"],
-                    "summary": e.get("summary", {}),
-                    "target_folder": e["proposed"]["target_folder"],
-                    "rationale": e["proposed"].get("rationale", ""),
+                    "kind": "move_file",
+                    "from": src,
+                    "to_folder": to_folder,
+                    "rationale": str(a.get("rationale") or "").strip() or "No rationale provided.",
                 }
-                for e in file_entries
-            ],
-        }
-        critique = critique_plan_with_adk(model=model_critic, draft_plan=draft_plan, timeout_seconds=timeout_seconds)
-        if not critique:
-            raise RuntimeError("Critic agent returned invalid output.")
-        notes["iterations"].append(critique)
-        if critique.get("approved") is True:
-            return file_entries, notes
-
-        revised = critique.get("revised_assignments")
-        if not isinstance(revised, list) or not revised:
-            raise RuntimeError("Critic did not approve but provided no revisions.")
-
-        for r in revised:
-            if not isinstance(r, dict):
+            )
+        elif kind == "update_index":
+            folder_path = _sanitize_folder_path(str(a.get("folder_path") or ""))
+            if folder_path == "(root)":
                 continue
-            file_key = r.get("file_key")
-            if file_key not in by_key:
-                continue
-            tf = r.get("target_folder") if isinstance(r.get("target_folder"), dict) else {}
-            name = normalize_folder_name((tf.get("name") or "").strip())
-            if not name or is_bad_folder_name(name):
-                raise RuntimeError(f"Critic proposed an invalid folder name: {name!r}")
-            by_key[file_key]["proposed"]["target_folder"] = {"name": name, "exists": name in folder_names}
-            by_key[file_key]["proposed"]["index_description_if_new"] = (r.get("index_description_if_new") or "").strip()
-            by_key[file_key]["proposed"]["rationale"] = (r.get("rationale") or "").strip()
+            norm_actions.append({"kind": "update_index", "folder_path": folder_path})
 
-        file_entries = list(by_key.values())
+    norm_decisions: list[dict[str, Any]] = []
+    for d in file_decisions:
+        if not isinstance(d, dict):
+            continue
+        fp = str(d.get("file_path") or "").replace("\\", "/").lstrip("/")
+        if not fp or fp not in inventory_rel_paths:
+            continue
+        
+        current_folder = _sanitize_folder_path(str(d.get("current_folder_path") or _folder_path_for_rel(fp)))
+        dest = _sanitize_folder_path(str(d.get("destination_folder_path") or "(root)"))
+        
+        # Compute derived fields
+        dest_exists = dest == "(root)" or dest in existing_folders
+        dest_will_be_created = dest in created_folders
+        move_required = current_folder != dest
+        
+        norm_decisions.append(
+            {
+                "file_path": fp,
+                "current_folder_path": current_folder,
+                "destination_folder_path": dest,
+                "destination_folder_exists": dest_exists,
+                "destination_folder_will_be_created": dest_will_be_created,
+                "move_required": move_required,
+                "rationale": str(d.get("rationale") or "").strip() or "No rationale provided.",
+            }
+        )
 
-    raise RuntimeError("Critic loop reached max iterations without approval.")
+    return {"actions": norm_actions, "file_decisions": norm_decisions}
 
 
-def _actions_from_entries(
+def build_local_plan(
     *,
-    mode: str,
-    base_folder_id: str | None,
-    folder_names: list[str],
-    entries: list[dict[str, Any]],
-) -> tuple[list[PlanAction], set[str], dict[str, str]]:
-    actions: list[PlanAction] = []
-    ensured_names: set[str] = set()
-    touched: set[str] = set()
-    intended_index_desc: dict[str, str] = {}
+    target: Path,
+    models: adk_agents.Models,
+    max_chars: int,
+    min_chars: int,
+    min_role_cluster_size: int,
+    min_project_cluster_size: int,
+    critic_iterations: int,
+    show_summaries: bool,
+    logging: bool,
+    adk_timeout_seconds: int,
+) -> dict[str, Any]:
+    if not target.exists() or not target.is_dir():
+        raise ValueError(f"Target must be an existing directory: {target}")
 
-    for e in entries:
-        target_name = e["proposed"]["target_folder"]["name"]
-        index_desc = (e["proposed"].get("index_description_if_new") or "").strip()
-        rationale = (e["proposed"].get("rationale") or "").strip()
+    # Mandatory store.
+    (target / STORE_DIR_NAME).mkdir(parents=True, exist_ok=True)
 
-        if target_name not in folder_names and target_name not in ensured_names:
-            actions.append(
-                PlanAction(
-                    kind="ensure_folder",
-                    folder_name=target_name,
-                    details={"reason": "Create folder (if missing)."},
-                )
-            )
-            ensured_names.add(target_name)
-            if index_desc:
-                intended_index_desc[target_name] = index_desc
-            touched.add(target_name)
-
-        if mode == "drive":
-            actions.append(
-                PlanAction(
-                    kind="move_file",
-                    folder_name=target_name,
-                    file_id=e["file_key"],
-                    file_name=e["filename"],
-                    details={"rationale": rationale},
-                )
-            )
-        else:
-            actions.append(
-                PlanAction(
-                    kind="move_file",
-                    folder_name=target_name,
-                    file_name=e["filename"],
-                    file_path=e.get("file_path"),
-                    details={"rationale": rationale},
-                )
-            )
-        touched.add(target_name)
-
-    return actions, touched, intended_index_desc
-
-
-def _render_index_md(*, folder_name: str, description: str) -> str:
-    now = datetime.utcnow().strftime("%Y-%m-%d")
-    description = (description or "").strip()
-    return (
-        f"# {folder_name}\n\n"
-        f"{description}\n\n"
-        f"---\n"
-        f"_Generated by SmartSorter {__version__} on {now}._\n"
+    _log(logging, f"[init] Target: {str(target)}")
+    _log(
+        logging,
+        f"[init] Models: summariser={models.summariser}, planner={models.planner}, critic={models.critic}, repair={models.repair}",
     )
+    _log(logging, "[init] Mode: dry-run (apply=false)")
 
+    inventory_files, inventory_folders = _list_bounded_inventory(target)
+    inventory_rel = [rel_posix(target, p) for p in inventory_files]
+    inventory_rel_set = set(inventory_rel)
 
-def execute_plan(plan: SortPlan, *, supports_all_drives: bool) -> None:
-    target = plan.folder_id if plan.mode == "drive" else plan.local_path
-    print(f"Target folder: {target}")
-    print(f"Planned actions: {len(plan.actions)}")
-    if plan.mode == "local":
-        _execute_local_plan(plan)
-        return
-    confirm = input("Apply these changes to Google Drive? Type 'yes' to continue: ").strip().lower()
-    if confirm != "yes":
-        print("Cancelled.")
-        return
+    _log(logging, f"[scan] Files to process ({len(inventory_files)}):")
+    for p in sorted(inventory_rel, key=str.lower)[:80]:
+        _log(logging, f"  - {p}")
+    if len(inventory_rel) > 80:
+        _log(logging, f"  - ... ({len(inventory_rel) - 80} more)")
 
-    folder_name_to_id: dict[str, str] = {}
+    _log(logging, f"[scan] Existing subfolders ({len(inventory_folders)}):")
+    for d in sorted(inventory_folders, key=lambda p: p.name.lower()):
+        _log(logging, f"  - {d.name}")
 
-    # First ensure folders and collect IDs.
-    for a in plan.actions:
-        if a.kind != "ensure_folder":
+    folder_profiles = _folder_profiles(target, inventory_folders)
+    existing_folders_set = {fp.folder_path for fp in folder_profiles}
+    if logging:
+        _log(logging, f"[context] Folder profiles ({len(folder_profiles)}):")
+        for fp in folder_profiles[:80]:
+            desc = f" desc: {fp.desc}" if fp.desc else ""
+            _log(logging, f"  - {fp.folder_path} (index: {'yes' if fp.has_index else 'no'}){desc}")
+
+    profiles = load_profiles(target)
+    cached = 0
+    needs = 0
+    for p in inventory_files:
+        rel = rel_posix(target, p)
+        existing = profiles.get(rel)
+        if existing and is_unchanged(existing=existing, path=p):
+            cached += 1
+        else:
+            needs += 1
+    _log(logging, f"[store] Loaded profiles: {len(profiles)}")
+    _log(logging, f"[store] Needs summarise: {needs} (cached={cached})")
+    
+    # Show cached profiles when logging is enabled
+    if logging and profiles:
+        _log(logging, "[store] Cached file profiles:")
+        for rel_path, prof in sorted(profiles.items(), key=lambda x: x[0].lower()):
+            if prof.skipped_reason:
+                _log(logging, f'  - {rel_path}: [SKIPPED] reason="{prof.skipped_reason}"')
+            else:
+                kw_str = ", ".join(prof.keywords[:5]) if prof.keywords else "(none)"
+                summary_preview = (prof.summary[:60] + "...") if len(prof.summary) > 60 else prof.summary
+                _log(logging, f'  - {rel_path}:')
+                _log(logging, f'      summary: "{summary_preview}"')
+                _log(logging, f'      subject: "{prof.subject_label}"')
+                _log(logging, f'      keywords: [{kw_str}]')
+
+    skipped: list[dict[str, Any]] = []
+    files_for_planning: list[dict[str, Any]] = []
+    files_for_cluster: list[FileForClustering] = []
+
+    for p in sorted(inventory_files, key=lambda x: rel_posix(target, x).lower()):
+        rel = rel_posix(target, p)
+        mime = sniff_mime_type(p)
+        existing = profiles.get(rel)
+
+        if existing and is_unchanged(existing=existing, path=p) and existing.skipped_reason:
+            skipped.append({"file_path": rel, "reason": existing.skipped_reason, "cached": True})
             continue
-        folder_id = ensure_folder(plan.folder_id, name=a.folder_name, supports_all_drives=supports_all_drives)
-        folder_name_to_id[a.folder_name] = folder_id
 
-    # Execute moves
-    for a in plan.actions:
+        if existing and is_unchanged(existing=existing, path=p) and not existing.skipped_reason:
+            files_for_planning.append(
+                {
+                    "file_path": rel,
+                    "current_folder_path": _folder_path_for_rel(rel),
+                    "file_profile": {
+                        "summary": existing.summary,
+                        "subject_label": existing.subject_label,
+                        "keywords": list(existing.keywords),
+                    },
+                }
+            )
+            files_for_cluster.append(
+                FileForClustering(
+                    file_path=rel,
+                    folder_path=_folder_path_for_rel(rel),
+                    keywords=list(existing.keywords),
+                    subject_label=existing.subject_label,
+                )
+            )
+            continue
+
+        extracted = _extract_file_text(p, max_chars=max_chars)
+        text_chars = extracted.char_count
+        _log(logging, f"[extract] {rel} method={extracted.method} chars={text_chars} (truncated={extracted.truncated})")
+
+        if text_chars < min_chars and not extracted.is_full_content:
+            reason = "insufficient extracted text"
+            _log(logging, f'[skip] {rel} reason="{reason}" chars={text_chars} min={min_chars}')
+            upsert_profile(
+                profiles=profiles,
+                rel_path=rel,
+                abs_path=p,
+                mime_type=mime,
+                text_chars=text_chars,
+                summary="",
+                subject_label="",
+                keywords=[],
+                skipped_reason=reason,
+            )
+            skipped.append({"file_path": rel, "reason": reason, "chars": text_chars})
+            continue
+
+        summary_obj = adk_agents.summarize_file(
+            model=models.summariser,
+            file_name=p.name,
+            text=extracted.text,
+            timeout_seconds=adk_timeout_seconds,
+        )
+        _log(
+            logging,
+            f'[summarise] {rel} summary="{summary_obj.get("summary","")}" subject_label="{summary_obj.get("subject_label","")}" keywords={summary_obj.get("keywords",[])}',
+        )
+
+        upsert_profile(
+            profiles=profiles,
+            rel_path=rel,
+            abs_path=p,
+            mime_type=mime,
+            text_chars=text_chars,
+            summary=str(summary_obj.get("summary") or ""),
+            subject_label=str(summary_obj.get("subject_label") or ""),
+            keywords=list(summary_obj.get("keywords") or []),
+            skipped_reason=None,
+        )
+
+        files_for_planning.append(
+            {
+                "file_path": rel,
+                "current_folder_path": _folder_path_for_rel(rel),
+                "file_profile": {
+                    "summary": str(summary_obj.get("summary") or ""),
+                    "subject_label": str(summary_obj.get("subject_label") or ""),
+                    "keywords": list(summary_obj.get("keywords") or []),
+                },
+            }
+        )
+        files_for_cluster.append(
+            FileForClustering(
+                file_path=rel,
+                folder_path=_folder_path_for_rel(rel),
+                keywords=list(summary_obj.get("keywords") or []),
+                subject_label=str(summary_obj.get("subject_label") or ""),
+            )
+        )
+
+        # Save incrementally to avoid losing progress on crash/interrupt
+        if len(files_for_planning) % 5 == 0:
+            save_profiles(target, profiles)
+
+    # Store is mandatory: persist profiles even for dry-runs.
+    save_profiles(target, profiles)
+
+    _log(logging, f"[global] Files with profiles: {len(files_for_planning)}")
+    _log(logging, f"[global] Skipped (no usable text): {len(skipped)}")
+
+    clusters_dict = detect_keyword_clusters(
+        files_for_cluster,
+        min_role_cluster_size=min_role_cluster_size,
+        min_project_cluster_size=min_project_cluster_size,
+    )
+    role_clusters = clusters_dict["role_clusters"]
+    project_clusters = clusters_dict["project_clusters"]
+
+    if logging:
+        _log(logging, "[cluster] Role clusters:")
+        for c in role_clusters[:5]:
+            _log(logging, f'  - "{c.label}" size={c.size}')
+        _log(logging, "[cluster] Project/topic clusters:")
+        for c in project_clusters[:5]:
+            _log(logging, f'  - "{c.label}" size={c.size}')
+
+    planning_snapshot: dict[str, Any] = {
+        "target": str(target),
+        "rules": {
+            "no_deletions": True,
+            "no_renames": True,
+            "top_level_only": True,
+            "min_role_cluster_size": int(min_role_cluster_size),
+            "min_project_cluster_size": int(min_project_cluster_size),
+            "precedence": "project_topic_folder_wins_over_role_folder",
+        },
+        "folders": [{"folder_path": f.folder_path, "name": f.name, "desc": f.desc, "has_index": f.has_index} for f in folder_profiles],
+        "files": files_for_planning,
+        "role_clusters": [asdict(c) for c in role_clusters[:50]],
+        "project_clusters": [asdict(c) for c in project_clusters[:50]],
+    }
+
+    plan_raw = adk_agents.plan_global(model=models.planner, planning_snapshot=planning_snapshot, timeout_seconds=adk_timeout_seconds)
+    plan = _normalize_plan(plan=plan_raw, inventory_rel_paths=inventory_rel_set, existing_folders=existing_folders_set)
+
+    critique: Optional[dict[str, Any]] = None
+    acceptable = False
+    max_iters = max(1, int(critic_iterations))
+    max_iters = min(max_iters, 5)
+
+    for iter_idx in range(1, max_iters + 1):
+        critique = adk_agents.critique_global_plan(
+            model=models.critic,
+            planning_snapshot=planning_snapshot,
+            plan=plan,
+            timeout_seconds=adk_timeout_seconds,
+        )
+        acceptable = bool(critique.get("acceptable"))
+        _log(logging, f'[critic] iter={iter_idx} acceptable={str(acceptable).lower()} rationale="{critique.get("critique_rationale","")}"')
+        if acceptable:
+            break
+        if iter_idx >= max_iters:
+            break
+        plan_repaired = adk_agents.repair_global_plan(
+            model=models.repair,
+            planning_snapshot=planning_snapshot,
+            plan=plan,
+            critique=critique,
+            timeout_seconds=adk_timeout_seconds,
+        )
+        plan = _normalize_plan(plan=plan_repaired, inventory_rel_paths=inventory_rel_set, existing_folders=existing_folders_set)
+        _log(logging, f"[repair] iter={iter_idx} updated plan")
+
+    # Always save latest plan + critique for inspection.
+    save_latest_plan(target, {"planning_snapshot": planning_snapshot, "plan": plan, "critique": critique, "accepted": acceptable})
+
+    report: dict[str, Any] = {
+        "mode": "local",
+        "target": str(target),
+        "store_dir": str(target / STORE_DIR_NAME),
+        "models": asdict(models),
+        "accepted": acceptable,
+        "critique": critique,
+        "skipped": skipped,
+        "global_plan": plan,
+        "actions": [],
+    }
+
+    if not acceptable:
+        if show_summaries:
+            report["human_summary"] = _human_summary(moves=[], created_folders=[], skipped=skipped)
+        return report
+
+    # Build execution actions from plan.
+    created_folders: list[str] = []
+    moves: list[dict[str, str]] = []
+    folder_desc: dict[str, str] = {}
+
+    for a in plan.get("actions") or []:
+        if a.get("kind") == "create_folder":
+            created_folders.append(a["path"])
+            if a.get("index_desc"):
+                folder_desc[a["path"]] = str(a.get("index_desc") or "").strip()
+        elif a.get("kind") == "move_file":
+            moves.append({"from": a["from"], "to_folder": a["to_folder"], "rationale": a.get("rationale") or ""})
+
+    # Ensure create_folder actions are first and unique.
+    create_unique = sorted(set(created_folders), key=str.lower)
+    actions: list[Action] = []
+    for folder_path in create_unique:
+        actions.append(Action(kind="create_folder", folder_name=folder_path, details={"index_desc": folder_desc.get(folder_path)}))
+
+    # Map file decisions for deterministic move list (even if plan omitted move actions).
+    decision_map: dict[str, dict[str, Any]] = {}
+    for d in plan.get("file_decisions") or []:
+        decision_map[str(d.get("file_path") or "")] = d
+
+    for rel in sorted(inventory_rel_set, key=str.lower):
+        d = decision_map.get(rel)
+        if not d:
+            continue
+        dest_folder = _sanitize_folder_path(str(d.get("destination_folder_path") or "(root)"))
+        src_folder = _folder_path_for_rel(rel)
+        if dest_folder == src_folder:
+            continue
+        actions.append(
+            Action(
+                kind="move_file",
+                folder_name=dest_folder,
+                file_path=target / rel,
+                file_name=Path(rel).name,
+                details={"from": rel, "to_folder": dest_folder, "rationale": str(d.get("rationale") or "").strip()},
+            )
+        )
+
+    # Index updates: any folder involved in create/move, plus parents of created folders.
+    touched: set[str] = set()
+    for f in create_unique:
+        touched.add(f)
+        if "/" in f:
+            touched.add(f.rsplit("/", 1)[0])
+    for a in actions:
+        if a.kind == "move_file":
+            to_folder = _sanitize_folder_path(str(a.folder_name or "(root)"))
+            if to_folder != "(root)":
+                touched.add(to_folder)
+            from_rel = str((a.details or {}).get("from") or "")
+            if from_rel:
+                src_folder = _folder_path_for_rel(from_rel)
+                if src_folder != "(root)":
+                    touched.add(src_folder)
+
+    # Compute planned layout for index content.
+    planned_folder_to_files: dict[str, list[str]] = {}
+    for rel in inventory_rel_set:
+        planned_folder_to_files.setdefault(_folder_path_for_rel(rel), []).append(rel)
+    for a in actions:
         if a.kind != "move_file":
             continue
-        to_id = folder_name_to_id.get(a.folder_name) or ensure_folder(
-            plan.folder_id, name=a.folder_name, supports_all_drives=supports_all_drives
+        from_rel = str((a.details or {}).get("from") or "")
+        if not from_rel:
+            continue
+        dest_folder = _sanitize_folder_path(str(a.folder_name or "(root)"))
+        src_folder = _folder_path_for_rel(from_rel)
+        if from_rel in planned_folder_to_files.get(src_folder, []):
+            planned_folder_to_files[src_folder].remove(from_rel)
+        new_rel = f"{dest_folder}/{Path(from_rel).name}" if dest_folder != "(root)" else Path(from_rel).name
+        planned_folder_to_files.setdefault(dest_folder, []).append(new_rel)
+
+    for folder_path in sorted({f for f in touched if f != "(root)"}, key=str.lower):
+        rels = sorted(planned_folder_to_files.get(folder_path, []), key=str.lower)
+        files_list: list[dict[str, str]] = []
+        for fp in rels[:200]:
+            prof = profiles.get(fp)
+            summ = prof.summary if prof else ""
+            files_list.append({"file_name": Path(fp).name, "summary": summ})
+        desc = folder_desc.get(folder_path)
+        managed_md = _render_managed_index(folder_path=folder_path, desc=desc, files=files_list)
+        actions.append(Action(kind="update_index", folder_name=folder_path, index_markdown=managed_md, details={"managed": True}))
+
+    # Add skip actions (for reporting/apply summary).
+    for s in skipped:
+        actions.append(
+            Action(
+                kind="skip_file",
+                file_name=Path(str(s.get("file_path") or "")).name or None,
+                file_path=safe_join_under_target(target, str(s.get("file_path") or "")) if s.get("file_path") else None,
+                details={"reason": s.get("reason")},
+            )
         )
-        folder_name_to_id[a.folder_name] = to_id
-        print(f"Move: {a.file_name} -> {a.folder_name}")
-        move_file(
-            a.file_id or "",
-            from_parent_id=plan.folder_id,
-            to_parent_id=to_id,
-            supports_all_drives=supports_all_drives,
-        )
 
-    # Write indexes
-    for a in plan.actions:
-        if a.kind != "write_index":
-            continue
-        folder_id = folder_name_to_id.get(a.folder_name) or ensure_folder(
-            plan.folder_id, name=a.folder_name, supports_all_drives=supports_all_drives
-        )
-        folder_name_to_id[a.folder_name] = folder_id
-        print(f"Index: {a.folder_name}/_index.md")
-        upsert_index_md(folder_id, index_markdown=a.index_markdown or "", supports_all_drives=supports_all_drives)
+    report["actions"] = [asdict(a) for a in actions]
+    if show_summaries:
+        report["human_summary"] = _human_summary(moves=moves, created_folders=create_unique, skipped=skipped)
+
+    if logging:
+        # Per-file placements first (as per spec Section 7.2)
+        file_decisions_list = plan.get("file_decisions") or []
+        _log(logging, "[plan] File placements:")
+        for d in sorted(file_decisions_list, key=lambda x: str(x.get("file_path", "")).lower()):
+            fp = d.get("file_path", "")
+            dest = d.get("destination_folder_path", "(root)")
+            new_folder = d.get("destination_folder_will_be_created", False)
+            move = d.get("move_required", False)
+            rationale = d.get("rationale", "")
+            dest_display = f"{dest}/" if dest != "(root)" else "(root)"
+            _log(logging, f"  - {fp} -> {dest_display} (new_folder={str(new_folder).lower()}, move={str(move).lower()}) rationale=\"{rationale}\"")
+
+        # Folder creates
+        _log(logging, "[plan] Create folders:")
+        if create_unique:
+            for f in create_unique:
+                idx_desc = folder_desc.get(f, "")
+                _log(logging, f"  - {f}/ (index_desc=\"{idx_desc}\")")
+        else:
+            _log(logging, "  - (none)")
+
+        # Summary with stats
+        total_files = len(inventory_rel_set)
+        profiled = len(files_for_planning)
+        skipped_count = len(skipped)
+        new_folders_count = len(create_unique)
+        moves_count = sum(1 for d in file_decisions_list if d.get("move_required", False))
+        leave_in_root_count = sum(1 for d in file_decisions_list if d.get("destination_folder_path") == "(root)" and not d.get("move_required", False))
+        index_updates_count = len([a for a in actions if a.kind == "update_index"])
+        
+        _log(logging, f"[plan] Summary: files={total_files} profiled={profiled} skipped={skipped_count} new_folders={new_folders_count} moves={moves_count} leave_in_root={leave_in_root_count} index_updates={index_updates_count}")
+        _log(logging, "[plan] File decisions saved to store")
+
+        # Exec output (create folders, moves, skipped - for apply preview)
+        _log(logging, "[exec] Create folders:")
+        for f in create_unique:
+            _log(logging, f"  - {f}/")
+        _log(logging, "[exec] Moves:")
+        for a in actions:
+            if a.kind == "move_file":
+                _log(logging, f"  - {(a.details or {}).get('from', '')} -> {a.folder_name}/")
+        if skipped:
+            _log(logging, "[exec] Skipped:")
+            for s in skipped:
+                _log(logging, f"  - {s.get('file_path')} ({s.get('reason')})")
+
+    return report
 
 
-def _execute_local_plan(plan: SortPlan) -> None:
-    if not plan.local_path:
-        raise ValueError("local_path missing for local plan")
-    base = Path(plan.local_path)
-    confirm = input("Apply these changes to local filesystem? Type 'yes' to continue: ").strip().lower()
-    if confirm != "yes":
-        print("Cancelled.")
-        return
+def apply_local_plan(*, target: Path, report: dict[str, Any], logging: bool) -> None:
+    """Apply the local plan to the filesystem."""
+    if not bool(report.get("accepted")):
+        raise RuntimeError("Global plan is unaccepted; refusing to apply.")
 
-    # Ensure folders
-    for a in plan.actions:
-        if a.kind != "ensure_folder":
-            continue
-        (base / a.folder_name).mkdir(parents=True, exist_ok=True)
+    profiles = load_profiles(target)
+    actions = report.get("actions") or []
+    for a in actions:
+        kind = a.get("kind")
+        if kind == "create_folder":
+            folder = _sanitize_folder_path(a.get("folder_name") or "")
+            if folder == "(root)":
+                continue
+            p = safe_join_under_target(target, folder)
+            if not p.exists():
+                _log(logging, f"[apply] Create folder: {folder}/")
+                p.mkdir(parents=True, exist_ok=True)
+        elif kind == "move_file":
+            dest_folder = _sanitize_folder_path(a.get("folder_name") or "(root)")
+            from_rel = str((a.get("details") or {}).get("from") or "").replace("\\", "/").lstrip("/")
+            if not from_rel:
+                continue
+            src = safe_join_under_target(target, from_rel)
+            dest_dir = target if dest_folder == "(root)" else safe_join_under_target(target, dest_folder)
+            dest = dest_dir / src.name
+            if not src.exists() or not src.is_file():
+                continue
+            if dest.exists():
+                _log(logging, f"[apply] Skip move (dest exists): {src.name} -> {dest_folder}/")
+                continue
+            _log(logging, f"[apply] Move: {from_rel} -> {dest_folder}/")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            new_rel = rel_posix(target, dest)
+            move_profile_entry(profiles=profiles, old_rel_path=from_rel, new_rel_path=new_rel, new_abs_path=dest)
+            mark_applied_destination(profiles=profiles, rel_path=new_rel, destination_folder=dest_folder)
+        elif kind == "update_index":
+            folder = _sanitize_folder_path(a.get("folder_name") or "")
+            if folder == "(root)":
+                continue
+            idx = safe_join_under_target(target, folder) / "_index.md"
+            managed_md = str(a.get("index_markdown") or "")
+            existing = idx.read_text(encoding="utf-8", errors="ignore") if idx.exists() else ""
+            updated = managed_index_update(existing, managed_md)
+            _log(logging, f"[apply] Update index: {folder}/_index.md (managed section)")
+            idx.write_text(updated, encoding="utf-8")
 
-    # Moves
-    for a in plan.actions:
-        if a.kind != "move_file":
-            continue
-        if not a.file_path:
-            continue
-        src = Path(a.file_path)
-        dest_dir = base / a.folder_name
-        dest = dest_dir / src.name
-        if src.resolve() == dest.resolve():
-            continue
-        print(f"Move: {src.name} -> {a.folder_name}")
-        shutil.move(str(src), str(dest))
-
-    # Indexes
-    for a in plan.actions:
-        if a.kind != "write_index":
-            continue
-        idx = base / a.folder_name / "_index.md"
-        print(f"Index: {a.folder_name}/_index.md")
-        idx.write_text(a.index_markdown or "", encoding="utf-8")
+    save_profiles(target, profiles)

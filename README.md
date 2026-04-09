@@ -1,40 +1,28 @@
-# SmartSorter (MVP)
+# SmartSorter (AI Folder Sorter)
 
-Minimal viable implementation of the plan in `docs/plan.md`: pick a Google Drive folder, analyze only its direct children, propose semantic folders, and (optionally) create/move/write `_index.md`.
+Organises top-level files inside a target folder into its direct subfolders using an LLM-driven plan.
 
-## Setup
-
-1) Create and activate a virtualenv
-
-2) Install dependencies:
+## Install
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3) Configure Google Drive auth (recommended: installed-app OAuth):
+## Dry-run (local)
 
 ```bash
-export GOOGLE_OAUTH_CLIENT_FILE="/absolute/path/to/client_secret.json"
-# Optional (defaults to token.json next to the client file)
-export GOOGLE_OAUTH_TOKEN_FILE="/absolute/path/to/token.json"
+python -m ai_folder_sorter --local-path /path/to/folder --show-summaries --critic-iterations 1 --logging
 ```
 
-## Run (dry-run by default)
+## Apply (local)
 
 ```bash
-python -m ai_folder_sorter --folder-id "<DRIVE_FOLDER_ID>"
-```
-
-## Apply changes (prompts before writing)
-
-```bash
-python -m ai_folder_sorter --folder-id "<DRIVE_FOLDER_ID>" --apply
+python -m ai_folder_sorter --local-path /path/to/folder --apply
 ```
 
 ## Notes
 
-- This MVP requires Google ADK + a working LLM configuration; it will fail fast if summaries cannot be produced.
-- This MVP uses Google Drive API exports for Google-native files (Docs/Sheets/Slides) and downloads text-like binaries when feasible.
-- `_index.md` is created/overwritten only in folders that were created or received moved files.
-- Local PDF summarization requires `pypdf` to extract text before summarization.
+- This tool requires LLM access (Gemini via `GOOGLE_API_KEY` or Vertex/ADC).
+- Behavior is specified in `docs/functional_spec.md`.

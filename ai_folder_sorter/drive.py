@@ -1,208 +1,186 @@
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Optional
+from glob import glob
 
-from .models import DriveItem
-
-
-READ_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-WRITE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+from google.auth.exceptions import RefreshError
 
 
-def google_creds(scopes: list[str]) -> object:
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials as UserCredentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
+@dataclass(frozen=True)
+class GooglePreviewStatus:
+    is_google: bool
+    google_fetched: bool
+    is_essentially_empty: bool
+    file_id: Optional[str] = None
+    error: Optional[str] = None
 
-    client_file = os.environ.get("GOOGLE_OAUTH_CLIENT_FILE", "").strip()
+
+def _google_creds() -> Optional[object]:
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+
+    client_file_env = os.environ.get("GOOGLE_OAUTH_CLIENT_FILE", "").strip()
+    client_file: Optional[str] = client_file_env or None
+
+    if not client_file:
+        # Convenience fallback for local development: if a client secret file is present in the repo root,
+        # use it without requiring env vars.
+        repo_root = Path(__file__).resolve().parents[1]
+        candidates = sorted(glob(str(repo_root / "client_secret_*.json")))
+        if candidates:
+            client_file = candidates[0]
+
     if client_file:
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials as _UserCreds
+        from google_auth_oauthlib.flow import InstalledAppFlow
+
         client_path = Path(client_file).expanduser().resolve()
         token_file_env = os.environ.get("GOOGLE_OAUTH_TOKEN_FILE", "").strip()
         token_path = Path(token_file_env).expanduser().resolve() if token_file_env else client_path.with_name("token.json")
+        # Secondary fallback for local dev: a repo-root token.json (common in this workspace).
+        if not token_path.exists():
+            repo_token = Path(__file__).resolve().parents[1] / "token.json"
+            if repo_token.exists():
+                token_path = repo_token.resolve()
 
-        creds: Optional[UserCredentials] = None
+        creds: Optional[_UserCreds] = None
         if token_path.exists():
-            creds = UserCredentials.from_authorized_user_file(str(token_path), scopes)
+            creds = _UserCreds.from_authorized_user_file(str(token_path), scopes)
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(str(client_path), scopes)
-                creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
-            token_path.write_text(creds.to_json(), encoding="utf-8")
+                try:
+                    creds.refresh(Request())
+                except RefreshError:
+                    # Token is invalid/revoked. Only attempt interactive auth if explicitly enabled.
+                    if os.environ.get("GOOGLE_OAUTH_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "y"}:
+                        creds = None
+                    else:
+                        return None
+            if not creds or not creds.valid:
+                if os.environ.get("GOOGLE_OAUTH_INTERACTIVE", "").strip().lower() in {"1", "true", "yes", "y"}:
+                    flow = InstalledAppFlow.from_client_secrets_file(str(client_path), scopes)
+                    creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+                    token_path.write_text(creds.to_json(), encoding="utf-8")
+                else:
+                    return None
 
         return creds
 
-    import google.auth
+    try:
+        import google.auth
 
-    creds, _ = google.auth.default(scopes=scopes)
-    return creds
+        creds, _ = google.auth.default(scopes=scopes)
+        return creds
+    except Exception:
+        return None
 
 
-def drive_service(scopes: list[str]) -> Any:
+def _drive_service(creds: object):
     from googleapiclient.discovery import build
 
-    creds = google_creds(scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def list_top_level_children(folder_id: str, *, supports_all_drives: bool) -> list[DriveItem]:
-    service = drive_service(scopes=READ_SCOPES)
-
-    q = f"'{folder_id}' in parents and trashed=false"
-    items: list[DriveItem] = []
-    page_token: Optional[str] = None
-
-    while True:
-        resp = (
-            service.files()
-            .list(
-                q=q,
-                fields="nextPageToken, files(id,name,mimeType,modifiedTime)",
-                pageToken=page_token,
-                pageSize=1000,
-                supportsAllDrives=supports_all_drives,
-                includeItemsFromAllDrives=supports_all_drives,
-            )
-            .execute()
-        )
-        for f in resp.get("files", []) or []:
-            items.append(
-                DriveItem(
-                    id=f["id"],
-                    name=f.get("name") or "",
-                    mime_type=f.get("mimeType") or "",
-                    modified_time=f.get("modifiedTime"),
-                )
-            )
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-
-    return items
-
-
-def export_google_native_text(file_id: str, *, mime_type: str, max_chars: int, supports_all_drives: bool) -> Optional[str]:
-    service = drive_service(scopes=READ_SCOPES)
-
-    if mime_type == "application/vnd.google-apps.spreadsheet":
-        export_mime = "text/csv"
-    elif mime_type in {
-        "application/vnd.google-apps.document",
-        "application/vnd.google-apps.presentation",
-        "application/vnd.google-apps.drawing",
-    }:
-        export_mime = "text/plain"
-    else:
-        return None
-
-    data = (
-        service.files()
-        .export(fileId=file_id, mimeType=export_mime, supportsAllDrives=supports_all_drives)
-        .execute()
-    )
+def export_google_stub_text(file_id: str, *, is_sheet: bool, max_chars: int, creds: object) -> str:
+    service = _drive_service(creds)
+    mime = "text/csv" if is_sheet else "text/plain"
+    data = service.files().export(fileId=file_id, mimeType=mime).execute()
     text = data.decode("utf-8", errors="ignore") if isinstance(data, (bytes, bytearray)) else str(data)
-    return text[:max_chars] if max_chars and max_chars > 0 else text
+    if isinstance(max_chars, int) and max_chars > 0:
+        return text[:max_chars]
+    return text
 
 
-def download_text_like_file(file_id: str, *, mime_type: str, max_chars: int, supports_all_drives: bool) -> Optional[str]:
-    if not (mime_type.startswith("text/") or mime_type in {"application/json", "application/xml"}):
-        return None
+def google_stub_header(path: Path) -> str:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+        obj = json.loads(raw or "{}")
+    except Exception:
+        return f"[google-stub] {path.name}\n"
 
-    service = drive_service(scopes=READ_SCOPES)
-    data = service.files().get_media(fileId=file_id, supportsAllDrives=supports_all_drives).execute()
-    text = data.decode("utf-8", errors="ignore") if isinstance(data, (bytes, bytearray)) else str(data)
-    return text[:max_chars] if max_chars and max_chars > 0 else text
-
-
-def find_child_by_name(parent_folder_id: str, *, name: str, supports_all_drives: bool) -> Optional[DriveItem]:
-    service = drive_service(scopes=READ_SCOPES)
-    safe_name = (name or "").replace("'", "\\'")
-    q = f"'{parent_folder_id}' in parents and trashed=false and name='{safe_name}'"
-    resp = (
-        service.files()
-        .list(
-            q=q,
-            fields="files(id,name,mimeType,modifiedTime)",
-            pageSize=10,
-            supportsAllDrives=supports_all_drives,
-            includeItemsFromAllDrives=supports_all_drives,
-        )
-        .execute()
-    )
-    files = resp.get("files", []) or []
-    if not files:
-        return None
-    f = files[0]
-    return DriveItem(
-        id=f["id"],
-        name=f.get("name") or "",
-        mime_type=f.get("mimeType") or "",
-        modified_time=f.get("modifiedTime"),
-    )
+    title = obj.get("title") or obj.get("name") or path.stem
+    url = obj.get("url") or obj.get("open_url") or obj.get("alternateLink") or obj.get("alternate_link")
+    mime = obj.get("mimeType") or obj.get("mime_type")
+    bits = [f"[google-stub] {title}"]
+    if mime:
+        bits.append(f"mime={mime}")
+    if url:
+        bits.append(f"url={url}")
+    return " ".join(bits).strip() + "\n"
 
 
-def read_small_text_file(file_id: str, *, max_chars: int, supports_all_drives: bool) -> Optional[str]:
-    service = drive_service(scopes=READ_SCOPES)
-    data = service.files().get_media(fileId=file_id, supportsAllDrives=supports_all_drives).execute()
-    text = data.decode("utf-8", errors="ignore") if isinstance(data, (bytes, bytearray)) else str(data)
-    return text[:max_chars] if max_chars and max_chars > 0 else text
-
-
-def ensure_folder(parent_folder_id: str, *, name: str, supports_all_drives: bool) -> str:
-    existing = find_child_by_name(parent_folder_id, name=name, supports_all_drives=supports_all_drives)
-    if existing and existing.is_folder:
-        return existing.id
-
-    service = drive_service(scopes=READ_SCOPES + WRITE_SCOPES)
-    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_folder_id]}
-    created = service.files().create(body=meta, fields="id", supportsAllDrives=supports_all_drives).execute()
-    return created["id"]
-
-
-def move_file(file_id: str, *, from_parent_id: str, to_parent_id: str, supports_all_drives: bool) -> None:
-    service = drive_service(scopes=READ_SCOPES + WRITE_SCOPES)
-    service.files().update(
-        fileId=file_id,
-        addParents=to_parent_id,
-        removeParents=from_parent_id,
-        fields="id, parents",
-        supportsAllDrives=supports_all_drives,
-    ).execute()
-
-
-def upsert_index_md(
-    folder_id: str,
+def google_preview_for_stub(
+    path: Path,
     *,
-    index_markdown: str,
-    supports_all_drives: bool,
-) -> Tuple[str, bool]:
-    existing = find_child_by_name(folder_id, name="_index.md", supports_all_drives=supports_all_drives)
-    service = drive_service(scopes=READ_SCOPES + WRITE_SCOPES)
-
-    from googleapiclient.http import MediaInMemoryUpload
-
-    media = MediaInMemoryUpload(index_markdown.encode("utf-8"), mimetype="text/markdown", resumable=False)
-    if existing:
-        updated = (
-            service.files()
-            .update(
-                fileId=existing.id,
-                media_body=media,
-                fields="id",
-                supportsAllDrives=supports_all_drives,
-            )
-            .execute()
+    file_id: Optional[str],
+    max_chars: int,
+) -> tuple[str, GooglePreviewStatus]:
+    header = google_stub_header(path)
+    if not file_id:
+        return (
+            header,
+            GooglePreviewStatus(is_google=True, google_fetched=False, is_essentially_empty=True, error="no file id"),
         )
-        return updated["id"], False
 
-    meta = {"name": "_index.md", "parents": [folder_id], "mimeType": "text/markdown"}
-    created = (
-        service.files()
-        .create(body=meta, media_body=media, fields="id", supportsAllDrives=supports_all_drives)
-        .execute()
-    )
-    return created["id"], True
+    try:
+        creds = _google_creds()
+    except Exception as e:
+        return (
+            header,
+            GooglePreviewStatus(
+                is_google=True,
+                google_fetched=False,
+                is_essentially_empty=True,
+                file_id=file_id,
+                error=f"google creds error: {e}",
+            ),
+        )
+    if not creds:
+        return (
+            header,
+            GooglePreviewStatus(
+                is_google=True,
+                google_fetched=False,
+                is_essentially_empty=True,
+                file_id=file_id,
+                error="no google credentials (set GOOGLE_OAUTH_CLIENT_FILE or enable GOOGLE_OAUTH_INTERACTIVE=1)",
+            ),
+        )
+
+    ext = path.suffix.lower()
+    if ext == ".gform":
+        return (
+            header,
+            GooglePreviewStatus(is_google=True, google_fetched=False, is_essentially_empty=True, file_id=file_id),
+        )
+
+    is_sheet = ext == ".gsheet"
+    try:
+        body = export_google_stub_text(file_id, is_sheet=is_sheet, max_chars=max_chars, creds=creds)
+        combined = (header + "\n" + body).strip()
+        essentially_empty = len(body.strip()) == 0
+        return (
+            combined,
+            GooglePreviewStatus(
+                is_google=True,
+                google_fetched=True,
+                is_essentially_empty=essentially_empty,
+                file_id=file_id,
+            ),
+        )
+    except Exception as e:
+        return (
+            header,
+            GooglePreviewStatus(
+                is_google=True,
+                google_fetched=False,
+                is_essentially_empty=True,
+                file_id=file_id,
+                error=str(e),
+            ),
+        )

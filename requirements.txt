@@ -1,12 +1,9 @@
+google-genai>=1.50.0
+google-adk>=1.0.0
 google-api-python-client>=2.120.0
 google-auth>=2.25.0
 google-auth-oauthlib>=1.2.0
-
-# Required for the ADK-powered summarizer + folder matching:
-google-adk
-
-# Required for real PDF text extraction (local mode):
+openpyxl>=3.1.2
+python-docx>=1.1.0
 pypdf>=4.0.0
-
-# Convenience: load GOOGLE_API_KEY etc from .env
 python-dotenv>=1.0.0

@@ -1,240 +1,256 @@
 from __future__ import annotations
 
-import asyncio
+import json
 import os
+import time
+from dataclasses import dataclass
 from typing import Any, Optional
 
-from .models import FolderDecision, Summary, TargetFolder
-from .utils import normalize_folder_name, parse_json_object_maybe, safe_get_str
+from google import genai
+
+from .prompts import CRITIQUE_GLOBAL_PLAN, PLAN_GLOBAL, REPAIR_GLOBAL_PLAN, SUMMARIZE_FILE
 
 
-def _require_adk():
-    try:
-        from google.adk.agents import LlmAgent  # noqa: F401
-        from google.adk.runners import InMemoryRunner  # noqa: F401
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(
-            "Google ADK is not available. Install it (and configure model credentials) or run with --allow-fallback."
-        ) from e
+@dataclass(frozen=True)
+class Models:
+    """Model configuration for different agent roles."""
+    summariser: str
+    critic: str
+    planner: str
+    repair: str
 
 
-def preflight_adk_auth() -> None:
-    """
-    ADK's GoogleLLM uses google.genai.Client() without explicit args, so auth must
-    be provided via environment variables.
-    """
-    api_key = (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
-    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "0").strip().lower() in {"1", "true"}
-    project = (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
-    location = (os.environ.get("GOOGLE_CLOUD_LOCATION") or "").strip()
+# =============================================================================
+# LLM Client and Retry Logic
+# =============================================================================
 
+def _client(*, timeout_seconds: int) -> genai.Client:
+    """Create a Gemini client with the specified timeout."""
+    # google-genai expects http_options.timeout in milliseconds (min 10s enforced server-side).
+    timeout_ms = max(int(timeout_seconds) * 1000, 10_000)
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     if api_key:
-        return
-
-    if use_vertex and (project or location):
-        return
-
-    raise RuntimeError(
-        "ADK/LLM auth is not configured.\n"
-        "- For Gemini API: set GOOGLE_API_KEY (or GEMINI_API_KEY).\n"
-        "- For Vertex AI: set GOOGLE_GENAI_USE_VERTEXAI=1 and GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION "
-        "(and have ADC configured).\n"
-    )
+        return genai.Client(api_key=api_key, http_options={"timeout": timeout_ms})
+    return genai.Client(http_options={"timeout": timeout_ms})
 
 
-async def _run_agent_once(*, agent: Any, state_delta: dict[str, Any], timeout_seconds: int) -> str:
-    from google.adk.runners import InMemoryRunner, types
-
-    runner = InMemoryRunner(agent, app_name="smart_sorter")
-    runner.session_service.create_session_sync(app_name="smart_sorter", user_id="smart_sorter", session_id="default")
-    last_text = ""
-    agen = runner.run_async(
-        user_id="smart_sorter",
-        session_id="default",
-        new_message=types.UserContent(parts=[types.Part(text="Run now.")]),
-        state_delta=state_delta,
-    )
-
-    async def _consume() -> str:
-        nonlocal last_text
-        async for event in agen:
-            if event.error_message:
-                raise RuntimeError(event.error_message)
-            content = getattr(event, "content", None)
-            parts = getattr(content, "parts", None) if content else None
-            if not parts:
-                continue
-            text_parts: list[str] = []
-            for p in parts:
-                t = getattr(p, "text", None)
-                if isinstance(t, str) and t:
-                    text_parts.append(t)
-            if text_parts:
-                last_text = "\n".join(text_parts).strip()
-            if getattr(event, "turn_complete", False) and last_text:
-                return last_text
-        return last_text
-
-    try:
-        return await asyncio.wait_for(_consume(), timeout=timeout_seconds)
-    except asyncio.TimeoutError as e:
-        raise TimeoutError(f"ADK call timed out after {timeout_seconds}s") from e
+def _strip_markdown_code_block(text: str) -> str:
+    """Strip markdown code block wrappers if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
 
 
-def _run_agent_once_sync(*, agent: Any, state_delta: dict[str, Any], timeout_seconds: int) -> str:
-    return asyncio.run(_run_agent_once(agent=agent, state_delta=state_delta, timeout_seconds=timeout_seconds))
-
-
-def summarize_with_adk(
-    *,
+def _call_json(
     model: str,
-    filename: str,
-    mime_type: str,
-    text_snippet: str,
-    metadata: dict[str, Any],
+    instruction: str,
+    payload: dict[str, Any],
     timeout_seconds: int,
-) -> Optional[Summary]:
-    _require_adk()
-    preflight_adk_auth()
-    from google.adk.agents import LlmAgent
+    *,
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+) -> dict[str, Any]:
+    """
+    Call the LLM and parse JSON response with retry logic.
+    
+    Args:
+        model: The model identifier
+        instruction: The system instruction
+        payload: The input payload to send as JSON
+        timeout_seconds: Timeout for the request
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay between retries (exponential backoff)
+        
+    Returns:
+        Parsed JSON response as a dict
+        
+    Raises:
+        RuntimeError: If all retries fail or response is invalid
+    """
+    client = _client(timeout_seconds=timeout_seconds)
+    prompt = instruction.strip() + "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False)
+    
+    last_error: Optional[Exception] = None
+    
+    for attempt in range(max_retries):
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                },
+            )
+            
+            text = (resp.text or "").strip()
+            if not text:
+                raise RuntimeError("Empty model response.")
+            
+            # Strip markdown code blocks if present (model sometimes ignores response_mime_type)
+            text = _strip_markdown_code_block(text)
+            
+            try:
+                result = json.loads(text)
+                # Handle single-element array wrapping
+                if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
+                    result = result[0]
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"Expected object, got {type(result).__name__}")
+                return result
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Model returned non-JSON: {text[:500]}") from e
+                
+        except Exception as e:
+            last_error = e
+            msg = str(e)
+            
+            # Don't retry on API key errors
+            if "API key not valid" in msg or "API_KEY_INVALID" in msg:
+                raise RuntimeError(
+                    "Gemini API key is invalid. Set a valid `GOOGLE_API_KEY`, or configure ADC/Vertex auth for `google-genai`."
+                ) from e
+            
+            # Don't retry on the last attempt
+            if attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)
+                time.sleep(delay)
+                continue
+            
+            raise RuntimeError(f"LLM call failed after {max_retries} attempts: {e}") from e
+    
+    # Should never reach here, but satisfy type checker
+    raise RuntimeError(f"LLM call failed: {last_error}")
 
-    agent = LlmAgent(
-        name="summariser_agent",
-        model=model,
-        include_contents="none",
-        instruction=(
-            "You summarise a file for semantic filing.\n"
-            "Input JSON:\n"
-            "{file_json}\n\n"
-            "Rules:\n"
-            "- Ignore file type for subject; focus on topic/intent.\n"
-            "- Output ONLY valid JSON with keys: summary, keywords, subject_label.\n"
-            "- keywords must be a short list of strings.\n"
-            "- subject_label should be 2-6 words.\n"
-        ),
+
+def summarize_file(*, model: str, file_name: str, text: str, timeout_seconds: int) -> dict[str, Any]:
+    """
+    Summarize a file's content using LLM.
+    
+    Args:
+        model: The model identifier to use
+        file_name: Name of the file being summarized
+        text: Extracted text content from the file
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        Dict with 'summary', 'subject_label', and 'keywords' keys
+    """
+    out = _call_json(
+        model,
+        SUMMARIZE_FILE.instruction,
+        {"file_name": file_name, "text": text},
+        timeout_seconds=timeout_seconds,
     )
-
-    file_json = {
-        "filename": filename,
-        "mimeType": mime_type,
-        "textSnippet": text_snippet,
-        "metadata": metadata,
-    }
-    resp_text = _run_agent_once_sync(agent=agent, state_delta={"file_json": file_json}, timeout_seconds=timeout_seconds)
-    obj = parse_json_object_maybe(resp_text)
-    summary = safe_get_str(obj, "summary") or ""
-    subject_label = safe_get_str(obj, "subject_label") or ""
-    keywords = obj.get("keywords") if isinstance(obj.get("keywords"), list) else []
-    keywords = [k.strip() for k in keywords if isinstance(k, str) and k.strip()]
-    if not summary or not subject_label:
-        return None
-    return Summary(summary=summary, keywords=keywords, subject_label=subject_label)
+    
+    summary = str(out.get("summary", "")).strip()[:200]
+    subject_label = str(out.get("subject_label", "")).strip()[:50]
+    keywords = out.get("keywords") or []
+    if not isinstance(keywords, list):
+        keywords = []
+    keywords = [str(k).strip() for k in keywords if str(k).strip()][:8]
+    
+    return {"summary": summary, "subject_label": subject_label, "keywords": keywords}
 
 
-def decide_folder_with_adk(
+def match_folder(
     *,
     model: str,
     file_profile: dict[str, Any],
-    existing_folders: list[dict[str, str]],
+    existing_folders: list[dict[str, Any]],
+    critique_hint: Optional[dict[str, Any]],
     timeout_seconds: int,
-) -> Optional[FolderDecision]:
-    _require_adk()
-    preflight_adk_auth()
-    from google.adk.agents import LlmAgent
-
-    agent = LlmAgent(
-        name="folder_matcher_agent",
-        model=model,
-        include_contents="none",
-        instruction=(
-            "You choose a semantic folder for a file.\n"
-            "Input JSON:\n"
-            "{input_json}\n\n"
-            "Rules:\n"
-            "- Prefer existing folders; create new folders only as a last resort.\n"
-            "- Foldering must be semantic (content/intent), never by file type (no 'PDFs', 'Images', etc.).\n"
-            "- Avoid entity-based and time-based names (no people, companies, years, quarters).\n"
-            "- Prefer plain-language, stable, role-based plural nouns (e.g., 'Agreements', 'Receipts', 'Plans').\n"
-            "- Output ONLY valid JSON with keys: target_folder (object with keys: name, exists), "
-            "index_description_if_new, rationale.\n"
-        ),
-    )
-
-    input_json = {"file_profile": file_profile, "existing_folders": existing_folders}
-    resp_text = _run_agent_once_sync(
-        agent=agent, state_delta={"input_json": input_json}, timeout_seconds=timeout_seconds
-    )
-    obj = parse_json_object_maybe(resp_text)
-    tf = obj.get("target_folder") if isinstance(obj.get("target_folder"), dict) else {}
-    name = normalize_folder_name(safe_get_str(tf, "name") or "")
-    exists_val = tf.get("exists")
-    exists = bool(exists_val) if isinstance(exists_val, bool) else False
-    index_desc = safe_get_str(obj, "index_description_if_new") or ""
-    rationale = safe_get_str(obj, "rationale") or ""
-    if not name:
-        return None
-    return FolderDecision(
-        target_folder=TargetFolder(name=name, exists=exists),
-        index_description_if_new=index_desc,
-        rationale=rationale,
-    )
+) -> dict[str, Any]:
+    raise NotImplementedError("Per-file matching has been replaced by global planning. Use plan_global().")
 
 
-def critique_plan_with_adk(
+def critique_plan(
     *,
     model: str,
-    draft_plan: dict[str, Any],
+    file_profile: dict[str, Any],
+    file_plan: dict[str, Any],
+    existing_folders: list[dict[str, Any]],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    raise NotImplementedError("Per-file critique has been replaced by global plan critique. Use critique_global_plan().")
+
+
+def plan_global(*, model: str, planning_snapshot: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
+    """
+    Generate a global filing plan for the target folder.
+    
+    Args:
+        model: The model identifier to use
+        planning_snapshot: The complete planning context
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        A dict with 'actions' and 'file_decisions' keys
+    """
+    return _call_json(
+        model,
+        PLAN_GLOBAL.instruction,
+        planning_snapshot,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def critique_global_plan(
+    *,
+    model: str,
+    planning_snapshot: dict[str, Any],
+    plan: dict[str, Any],
     timeout_seconds: int,
 ) -> dict[str, Any]:
     """
-    Reviews the entire draft plan and returns either approval or specific revisions.
-
-    Expected output JSON:
-      {
-        "approved": true|false,
-        "revised_assignments": [
-          {
-            "file_key": "...",
-            "target_folder": {"name": "..."},
-            "index_description_if_new": "...",
-            "rationale": "..."
-          }
-        ],
-        "notes": "..."
-      }
+    Critique a global filing plan.
+    
+    Args:
+        model: The model identifier to use
+        planning_snapshot: The planning context
+        plan: The plan to critique
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        A dict with 'acceptable', 'critique_rationale', and optional 'suggested_adjustments'
     """
-    _require_adk()
-    preflight_adk_auth()
-    from google.adk.agents import LlmAgent
-
-    agent = LlmAgent(
-        name="plan_critic_agent",
-        model=model,
-        include_contents="none",
-        instruction=(
-            "You are a critic reviewing a draft file-organisation plan.\n"
-            "Input JSON:\n"
-            "{draft_plan}\n\n"
-            "Your job:\n"
-            "- Enforce bounded specificity: prefer reusing existing/proposed folders; avoid creating many tiny folders.\n"
-            "- Reject type buckets (PDFs/Images/etc), entity-based names (people/companies), and time-based names (years/quarters).\n"
-            "- Prefer plain-language, stable, role-based plural nouns.\n"
-            "- Keep folder counts reasonable (target ~7-12, soft cap ~15) by merging near-duplicates.\n\n"
-            "Output ONLY valid JSON with keys:\n"
-            "- approved (boolean)\n"
-            "- revised_assignments (list; empty if approved). Each item must include: file_key, "
-            "target_folder (object with key: name), index_description_if_new, rationale.\n"
-            "- notes (string)\n"
-            "Rules:\n"
-            "- Only propose changes when clearly beneficial; otherwise set approved=true.\n"
-            "- Do not invent file keys; use only file_key values from the input.\n"
-        ),
+    return _call_json(
+        model,
+        CRITIQUE_GLOBAL_PLAN.instruction,
+        {"planning_snapshot": planning_snapshot, "plan": plan},
+        timeout_seconds=timeout_seconds,
     )
 
-    resp_text = _run_agent_once_sync(
-        agent=agent, state_delta={"draft_plan": draft_plan}, timeout_seconds=timeout_seconds
+
+def repair_global_plan(
+    *,
+    model: str,
+    planning_snapshot: dict[str, Any],
+    plan: dict[str, Any],
+    critique: dict[str, Any],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """
+    Repair a global filing plan based on critic feedback.
+    
+    Args:
+        model: The model identifier to use
+        planning_snapshot: The planning context
+        plan: The original plan
+        critique: The critic's feedback
+        timeout_seconds: Timeout for the LLM call
+        
+    Returns:
+        A revised plan with the same schema as the original
+    """
+    return _call_json(
+        model,
+        REPAIR_GLOBAL_PLAN.instruction,
+        {"planning_snapshot": planning_snapshot, "plan": plan, "critique": critique},
+        timeout_seconds=timeout_seconds,
     )
-    obj = parse_json_object_maybe(resp_text)
-    if "approved" not in obj:
-        return {}
-    return obj if isinstance(obj, dict) else {}
